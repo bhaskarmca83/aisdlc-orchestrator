@@ -91,8 +91,13 @@ async def run_pipeline(req: RunRequest):
         "stories":                [],
         "assigned_repos":         [],
         "design_artifacts":       {},
-        "approval_payload":       None,
-        "files_changed":          [],
+        "approval_payload":                None,
+        "po_approval":                     None,
+        "arch_approval":                   None,
+        "confluence_requirements_page_id": "",
+        "confluence_tsd_page_id":          "",
+        "deployment_config":               None,
+        "files_changed":                   [],
         "feature_branches":       {},
         "test_result":            None,
         "review_result":          None,
@@ -134,15 +139,22 @@ async def _run_graph(execution_id: str, state: SDLCState, config: dict):
                 {"data": json.dumps({"type": "stage_update", "stage": stage, "data": {}})},
                 maxlen=1000,
             )
-            # Check for interrupt (gate)
+            # Check for interrupt at either gate
             snap = await graph.aget_state(config)
-            if snap and snap.next == ("gate",):
+            if snap and snap.next and snap.next[0] in ("po_gate", "arch_gate"):
+                gate = snap.next[0]
                 await redis.set(
                     f"run:{execution_id}:status",
-                    json.dumps({"status": "awaiting_approval", "stage": "gate"}),
+                    json.dumps({"status": "awaiting_approval", "stage": gate}),
                     ex=3600,
                 )
-                return  # Pause here; /api/gate/{id}/approve will resume
+                await redis.xadd(
+                    f"sdlc:events:{execution_id}",
+                    {"data": json.dumps({"type": "gate", "gate": gate,
+                                         "message": _gate_message(gate, snap.values)})},
+                    maxlen=1000,
+                )
+                return  # Pause; /api/gate/{id}/approve will resume
 
         await redis.set(
             f"run:{execution_id}:status",
@@ -161,34 +173,80 @@ async def _run_graph(execution_id: str, state: SDLCState, config: dict):
         )
 
 
+# ─── Gate helpers ─────────────────────────────────────────────────────────────
+
+def _gate_message(gate: str, values: dict) -> str:
+    if gate == "po_gate":
+        stories = values.get("stories", [])
+        return (f"PO Review: {len(stories)} stories created. "
+                f"Review them in Jira and approve to proceed to Technical Design.")
+    if gate == "arch_gate":
+        tsd_id = values.get("confluence_tsd_page_id", "")
+        page_url = (f"https://bhaskarmca83.atlassian.net/wiki/spaces/SD/pages/{tsd_id}"
+                    if tsd_id else "Confluence SD space")
+        return f"Architect Review: Technical Design doc ready at {page_url}. Approve to start implementation."
+    return "Awaiting approval"
+
+
 # ─── Gate approval ────────────────────────────────────────────────────────────
 
 @app.post("/api/gate/{execution_id}/approve")
 async def approve_gate(execution_id: str, req: ApproveRequest):
     config = {"configurable": {"thread_id": execution_id}}
     snap   = await graph.aget_state(config)
-    if not snap or snap.next != ("gate",):
-        raise HTTPException(status_code=400, detail="Pipeline is not waiting at gate")
 
-    await graph.aupdate_state(
-        config,
-        {"approval_payload": {"approved": req.approved, "reason": req.reason}},
-    )
+    if not snap or not snap.next:
+        raise HTTPException(status_code=400, detail="Pipeline is not waiting at a gate")
+
+    active_gate = snap.next[0] if snap.next else None
+    if active_gate not in ("po_gate", "arch_gate"):
+        raise HTTPException(status_code=400, detail=f"Pipeline is at '{active_gate}', not a gate node")
+
+    # Write the approval into the correct state field
+    approval = {"approved": req.approved, "reason": req.reason}
+    if active_gate == "po_gate":
+        await graph.aupdate_state(config, {"po_approval": approval, "approval_payload": approval})
+        next_stage = "design"
+    else:
+        await graph.aupdate_state(config, {"arch_approval": approval, "approval_payload": approval})
+        next_stage = "implement"
 
     await redis.set(
         f"run:{execution_id}:status",
-        json.dumps({"status": "running", "stage": "implement"}),
+        json.dumps({"status": "running", "stage": next_stage}),
         ex=3600,
     )
 
     asyncio.create_task(_resume_graph(execution_id, config))
-    return {"execution_id": execution_id, "approved": req.approved}
+    return {"execution_id": execution_id, "gate": active_gate, "approved": req.approved}
 
 
 async def _resume_graph(execution_id: str, config: dict):
     try:
-        async for _ in graph.astream(None, config):
-            pass
+        async for event in graph.astream(None, config):
+            stage = list(event.keys())[0] if event else "unknown"
+            await redis.xadd(
+                f"sdlc:events:{execution_id}",
+                {"data": json.dumps({"type": "stage_update", "stage": stage})},
+                maxlen=1000,
+            )
+            # Check if we hit the second gate
+            snap = await graph.aget_state(config)
+            if snap and snap.next and snap.next[0] in ("po_gate", "arch_gate"):
+                gate = snap.next[0]
+                await redis.set(
+                    f"run:{execution_id}:status",
+                    json.dumps({"status": "awaiting_approval", "stage": gate}),
+                    ex=3600,
+                )
+                await redis.xadd(
+                    f"sdlc:events:{execution_id}",
+                    {"data": json.dumps({"type": "gate", "gate": gate,
+                                         "message": _gate_message(gate, snap.values)})},
+                    maxlen=1000,
+                )
+                return
+
         await redis.set(
             f"run:{execution_id}:status",
             json.dumps({"status": "completed", "stage": "done"}),

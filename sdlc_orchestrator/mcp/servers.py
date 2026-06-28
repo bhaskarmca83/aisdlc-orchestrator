@@ -1,5 +1,6 @@
 """sdlc_orchestrator/mcp/servers.py
-MCP server subprocess configurations for each external integration.
+MCP server subprocess configurations and per-agent tool allowlists.
+Each agent only sees the tools it actually needs — not all 73 Atlassian tools.
 """
 import os
 import sys
@@ -8,7 +9,6 @@ from mcp import StdioServerParameters
 
 
 def _atlassian_server() -> StdioServerParameters:
-    # Use the installed CLI entry point (mcp-atlassian) in the same venv
     cli = str(Path(sys.executable).parent / "mcp-atlassian")
     return StdioServerParameters(
         command=cli,
@@ -51,7 +51,7 @@ SERVER_CONFIGS = {
     "playwright": _playwright_server,
 }
 
-# Which tools each agent role is allowed to use
+# Which MCP servers each agent stage uses
 AGENT_TOOL_SERVERS = {
     "confluence":  ["atlassian"],
     "stories":     ["atlassian"],
@@ -59,6 +59,73 @@ AGENT_TOOL_SERVERS = {
     "implement":   ["github"],
     "test":        ["github"],
     "review":      ["github"],
-    "deploy":      [],            # deploy uses local subprocess (helm/kubectl)
+    "deploy":      [],
     "e2e":         ["playwright", "github"],
+}
+
+# Allowlist of tool name substrings per agent — agents only see tools matching these.
+# Keeps small local models from being overwhelmed by irrelevant tools.
+AGENT_TOOL_FILTER: dict[str, list[str]] = {
+    "confluence": [
+        "confluence_get_page",
+        "confluence_create_page",
+        "confluence_update_page",
+        "confluence_search",
+        "get_confluence_page",
+        "create_confluence_page",
+        "update_confluence_page",
+        "search_confluence",
+    ],
+    "stories": [
+        "create_jira_issue",
+        "jira_create_issue",
+        "search_jira",
+        "jira_search",
+        "get_jira_issue",
+        "jira_get_issue",
+    ],
+    "design": [
+        "create_confluence_page",
+        "confluence_create_page",
+        "update_confluence_page",
+        "confluence_update_page",
+        "add_comment",
+        "jira_add_comment",
+        "confluence_get_page",
+        "get_confluence_page",
+    ],
+    "implement": [
+        "create_branch",
+        "push_file",
+        "create_pull_request",
+        "get_file_contents",
+        "create_or_update_file",
+        "search_repositories",
+    ],
+    "test": [
+        "push_file",
+        "get_file_contents",
+        "create_or_update_file",
+        "create_branch",
+    ],
+    "review": [
+        "get_pull_request",
+        "create_review",
+        "list_pull_requests",
+        "get_file_contents",
+        "create_pull_request_review",
+    ],
+    "deploy": [],
+    "e2e": [
+        "navigate",
+        "click",
+        "screenshot",
+        "fill",
+        "push_file",
+        "create_or_update_file",
+        "browser_navigate",
+        "browser_click",
+        "browser_screenshot",
+        "browser_type",
+    ],
 }

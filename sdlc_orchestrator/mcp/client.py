@@ -11,7 +11,7 @@ from mcp.client.stdio import stdio_client
 from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_core.tools import BaseTool
 
-from sdlc_orchestrator.mcp.servers import SERVER_CONFIGS, AGENT_TOOL_SERVERS
+from sdlc_orchestrator.mcp.servers import SERVER_CONFIGS, AGENT_TOOL_SERVERS, AGENT_TOOL_FILTER
 from sdlc_orchestrator.monitoring.tracker import emit, EventType
 
 
@@ -61,12 +61,23 @@ class MCPClientManager:
                 self._tools.clear()
 
     def get_tools_for_agent(self, agent_stage: str) -> list[BaseTool]:
-        """Return the union of tools from all servers the agent is allowed to use."""
+        """Return filtered tools for the agent — only what it actually needs."""
         server_names = AGENT_TOOL_SERVERS.get(agent_stage, [])
-        tools: list[BaseTool] = []
+        allowed_substrings = AGENT_TOOL_FILTER.get(agent_stage, [])
+
+        all_tools: list[BaseTool] = []
         for name in server_names:
-            tools.extend(self._tools.get(name, []))
-        return tools
+            all_tools.extend(self._tools.get(name, []))
+
+        if not allowed_substrings:
+            return all_tools  # no filter configured → return all (deploy/e2e with no servers)
+
+        filtered = [
+            t for t in all_tools
+            if any(substr.lower() in t.name.lower() for substr in allowed_substrings)
+        ]
+        # Fallback: if filter is too strict and nothing matched, return all tools
+        return filtered if filtered else all_tools
 
     def get_tools(self, *server_names: str) -> list[BaseTool]:
         tools: list[BaseTool] = []
