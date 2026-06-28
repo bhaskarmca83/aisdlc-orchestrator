@@ -1,0 +1,1 @@
+# Tool integrations — Confluence, Jira, GitHub, CI/CD
