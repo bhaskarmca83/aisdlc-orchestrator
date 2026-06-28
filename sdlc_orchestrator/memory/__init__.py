@@ -1,0 +1,1 @@
+# Shared memory — Redis + Postgres + pgvector
