@@ -3,7 +3,7 @@ LangGraph topology: 9 nodes, linear flow with conditional retry loops and human 
 """
 import os
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.redis import RedisSaver
+from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 
 from sdlc_orchestrator.state import SDLCState
 from sdlc_orchestrator.agents.confluence_agent   import confluence_agent_node
@@ -93,7 +93,7 @@ def build_graph() -> StateGraph:
     builder.add_conditional_edges("deploy", route_after_deploy, {"e2e": "e2e",        END: END})
     builder.add_edge("e2e", END)
 
-    checkpointer = RedisSaver.from_conn_string(os.environ["REDIS_URL"])
+    checkpointer = AsyncRedisSaver(redis_url=os.environ["REDIS_URL"])
 
     return builder.compile(
         checkpointer=checkpointer,
