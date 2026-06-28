@@ -3,13 +3,16 @@ MCP server subprocess configurations for each external integration.
 """
 import os
 import sys
+from pathlib import Path
 from mcp import StdioServerParameters
 
 
 def _atlassian_server() -> StdioServerParameters:
+    # Use the installed CLI entry point (mcp-atlassian) in the same venv
+    cli = str(Path(sys.executable).parent / "mcp-atlassian")
     return StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "mcp_atlassian"],
+        command=cli,
+        args=[],
         env={
             **os.environ,
             "CONFLUENCE_URL":       os.environ.get("CONFLUENCE_BASE_URL", ""),
@@ -18,6 +21,7 @@ def _atlassian_server() -> StdioServerParameters:
             "JIRA_URL":             os.environ.get("JIRA_BASE_URL", ""),
             "JIRA_USERNAME":        os.environ.get("JIRA_EMAIL", ""),
             "JIRA_API_TOKEN":       os.environ.get("JIRA_API_TOKEN", ""),
+            "TOOLSETS":             "all",
         },
     )
 
