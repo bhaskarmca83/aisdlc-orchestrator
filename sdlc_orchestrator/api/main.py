@@ -38,7 +38,6 @@ async def startup():
     try:
         await mcp_manager.start()
     except Exception as e:
-        # MCP servers are optional — log but don't block startup
         print(f"[startup] MCP manager failed to start (tools unavailable): {e}")
 
 
@@ -136,7 +135,7 @@ async def _run_graph(execution_id: str, state: SDLCState, config: dict):
                 maxlen=1000,
             )
             # Check for interrupt (gate)
-            snap = graph.get_state(config)
+            snap = await graph.aget_state(config)
             if snap and snap.next == ("gate",):
                 await redis.set(
                     f"run:{execution_id}:status",
@@ -167,11 +166,11 @@ async def _run_graph(execution_id: str, state: SDLCState, config: dict):
 @app.post("/api/gate/{execution_id}/approve")
 async def approve_gate(execution_id: str, req: ApproveRequest):
     config = {"configurable": {"thread_id": execution_id}}
-    snap   = graph.get_state(config)
+    snap   = await graph.aget_state(config)
     if not snap or snap.next != ("gate",):
         raise HTTPException(status_code=400, detail="Pipeline is not waiting at gate")
 
-    graph.update_state(
+    await graph.aupdate_state(
         config,
         {"approval_payload": {"approved": req.approved, "reason": req.reason}},
     )
@@ -242,7 +241,7 @@ async def get_status(execution_id: str):
 @app.get("/api/pipeline/{execution_id}/state")
 async def get_state_snapshot(execution_id: str):
     config = {"configurable": {"thread_id": execution_id}}
-    snap   = graph.get_state(config)
+    snap   = await graph.aget_state(config)
     if not snap:
         raise HTTPException(status_code=404, detail="State not found")
     return {"values": snap.values, "next": list(snap.next)}
