@@ -1,22 +1,41 @@
 """sdlc_orchestrator/agents/deploy_agent.py
-Deploys to EKS using Helm, monitors rollout, triggers rollback on failure.
+Deploy agent: generates Terraform + GitHub Actions plans via LLM.
+No MCP tools required — uses LLM + state context only.
 """
 import json
+import re
 import os
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from sdlc_orchestrator.state import SDLCState
 from sdlc_orchestrator.memory.shared_memory import SharedMemory
 from sdlc_orchestrator.providers.provider_factory import ProviderFactory, AgentRole
 from sdlc_orchestrator.monitoring.tracker import EventType, emit, track_stage
-from sdlc_orchestrator.tools.deploy_tools import (
-    helm_upgrade, helm_rollback, get_pod_status, wait_for_rollout,
-)
-from sdlc_orchestrator.tools.jira_tools import update_story_status, add_comment
 
-HELM_CHART_DIR  = os.environ.get("HELM_CHART_PATH", "../aisdlc-infra/helm/aisdlc-orchestrator")
-DEPLOY_ENV      = os.environ.get("DEPLOY_ENV", "dev")
-IMAGE_TAG_PREFIX = os.environ.get("IMAGE_TAG_PREFIX", "latest")
+DEPLOY_ENV = os.environ.get("DEPLOY_ENV", "dev")
+
+SYSTEM_PROMPT = """You are a Senior DevOps Engineer specialising in Kubernetes, Terraform, and CI/CD.
+
+Your task:
+1. Generate a Terraform plan for the infra changes needed by the stories
+2. Generate GitHub Actions workflow YAML to build, test, and deploy
+3. Identify any infra drift or risks
+
+Respond with ONLY valid JSON:
+{
+  "terraform_plan": {
+    "resources": [{"type": "...", "name": "...", "action": "create|update|destroy"}],
+    "estimated_cost_usd": 0.0,
+    "risks": ["..."]
+  },
+  "github_actions": {
+    "workflow_name": "...",
+    "yaml": "..."
+  },
+  "deployment_steps": ["..."],
+  "rollback_plan": "...",
+  "environment": "dev|staging|prod"
+}"""
 
 
 async def deploy_agent_node(state: SDLCState) -> SDLCState:
@@ -25,8 +44,6 @@ async def deploy_agent_node(state: SDLCState) -> SDLCState:
 
         mem = SharedMemory(state["project_id"])
         await mem.init()
-
-        ctx       = await mem.get_project_context()
         learnings = await mem.get_accumulated_learnings(limit=5)
 
         review_result = state.get("review_result", {})
@@ -34,106 +51,63 @@ async def deploy_agent_node(state: SDLCState) -> SDLCState:
             emit(EventType.INFO, "Review requested changes — skipping deploy")
             return {
                 **state,
-                "deploy_status": {"dev": "skipped", "reason": "review_requested_changes"},
+                "deploy_status": {DEPLOY_ENV: "skipped"},
                 "current_stage": "deploy",
             }
 
         llm = ProviderFactory.get_model(AgentRole.DEPLOY)
 
-        # Ask LLM to produce a deploy plan
-        prompt = (
-            "You are a DevOps engineer. Given the deploy context, return a JSON deploy plan:\n"
-            "{\n"
-            '  "image_tag": "...",\n'
-            '  "values_file": "values-dev.yaml | values-staging.yaml | values-prod.yaml",\n'
-            '  "release_name": "aisdlc-orchestrator",\n'
-            '  "namespace": "aisdlc",\n'
-            '  "notes": "..."\n'
-            "}\n\n"
-            f"Deploy env: {DEPLOY_ENV}\n"
-            f"Files changed: {len(state.get('files_changed', []))}\n"
+        stories       = state.get("stories", [])
+        files_changed = state.get("files_changed", [])
+
+        stories_text  = "\n".join(f"- [{s.get('jira_key','N/A')}] {s.get('summary','')}" for s in stories)
+        files_text    = json.dumps(files_changed[:10], indent=2)
+        learning_ctx  = json.dumps([l["content"] for l in learnings[:3]], indent=2) if learnings else ""
+
+        user_message = (
+            f"Tech stack: {', '.join(state.get('tech_stack', []))}\n"
+            f"Target environment: {DEPLOY_ENV}\n"
             f"Review score: {review_result.get('score', 0)}\n"
-            f"Test coverage: {json.dumps(state.get('test_coverage_map', {}))}"
+            f"Test coverage: {json.dumps(state.get('test_coverage_map', {}))}\n\n"
+            f"Stories:\n{stories_text}\n\n"
+            f"Files changed:\n{files_text}\n"
+            + (f"\nPrior deployment patterns:\n{learning_ctx}" if learning_ctx else "")
         )
 
-        emit(EventType.LLM, "Calling LLM for deploy plan")
-        response = await llm.ainvoke([HumanMessage(content=prompt)])
-        raw      = response.content
+        emit(EventType.LLM, "Calling LLM for deployment plan")
+        response = await llm.ainvoke([
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=user_message),
+        ])
+        raw = response.content
 
         try:
-            plan = json.loads(raw)
+            result = json.loads(raw)
         except json.JSONDecodeError:
-            import re
             m = re.search(r"\{.*\}", raw, re.DOTALL)
-            plan = json.loads(m.group()) if m else {}
+            result = json.loads(m.group()) if m else {"deployment_steps": [], "environment": DEPLOY_ENV}
 
-        image_tag   = plan.get("image_tag", IMAGE_TAG_PREFIX)
-        values_file = f"{HELM_CHART_DIR}/{plan.get('values_file', f'values-{DEPLOY_ENV}.yaml')}"
-        release     = plan.get("release_name", "aisdlc-orchestrator")
-        namespace   = plan.get("namespace", "aisdlc")
-
-        emit(EventType.INFO, f"Deploying {release}:{image_tag} to {namespace} via {values_file}")
-
-        deploy_result = await helm_upgrade(
-            release=release,
-            values_file=values_file,
-            image_tag=image_tag,
-            namespace=namespace,
-        )
-
-        deploy_status: dict[str, str] = dict(state.get("deploy_status", {}))
+        deploy_status  = dict(state.get("deploy_status", {}))
         deploy_history = list(state.get("deploy_history", []))
-
-        if deploy_result["success"]:
-            emit(EventType.DONE, f"Helm upgrade succeeded for {release}")
-
-            # Wait for pods
-            rollout = await wait_for_rollout(release, namespace=namespace, timeout_seconds=180)
-            if not rollout["success"]:
-                emit(EventType.ERROR, "Rollout did not complete — triggering rollback")
-                await helm_rollback(release, namespace=namespace)
-                deploy_status[DEPLOY_ENV] = "rollback"
-            else:
-                pods = await get_pod_status(namespace)
-                emit(EventType.INFO, f"Pods: {[p['name'] + '=' + p['phase'] for p in pods]}")
-                deploy_status[DEPLOY_ENV] = "success"
-        else:
-            emit(EventType.ERROR, f"Helm upgrade failed: {deploy_result.get('stderr', '')}")
-            await helm_rollback(release, namespace=namespace)
-            deploy_status[DEPLOY_ENV] = "failed"
-
-        deploy_history.append({
-            "env":        DEPLOY_ENV,
-            "image_tag":  image_tag,
-            "status":     deploy_status[DEPLOY_ENV],
-            "stdout":     deploy_result.get("stdout", "")[:500],
-        })
-
-        # Update Jira stories
-        for story in state.get("stories", []):
-            if story.get("jira_key"):
-                try:
-                    new_status = "Done" if deploy_status[DEPLOY_ENV] == "success" else "In Progress"
-                    await update_story_status(story["jira_key"], new_status)
-                    await add_comment(
-                        story["jira_key"],
-                        f"Deployed to {DEPLOY_ENV}: {deploy_status[DEPLOY_ENV]} (image: {image_tag})",
-                    )
-                except Exception as e:
-                    emit(EventType.ERROR, f"Jira update failed: {e}")
+        deploy_status[DEPLOY_ENV] = "planned"
+        deploy_history.append({"env": DEPLOY_ENV, "status": "planned",
+                                "resources": len(result.get("terraform_plan", {}).get("resources", []))})
 
         await mem.save_story_learning({
             "story_id":     state.get("current_story_id", ""),
             "agent_name":   "deploy",
-            "learning_type":"deploy_result",
-            "content":      {"env": DEPLOY_ENV, "status": deploy_status[DEPLOY_ENV], "image_tag": image_tag},
+            "learning_type":"deploy_plan",
+            "content":      {"environment": DEPLOY_ENV,
+                             "resource_count": len(result.get("terraform_plan", {}).get("resources", []))},
             "metadata":     {},
         })
 
+        emit(EventType.DONE, f"Deploy plan ready for env={DEPLOY_ENV}")
         return {
             **state,
-            "deploy_status":  deploy_status,
-            "deploy_history": deploy_history,
-            "env_urls":       {**state.get("env_urls", {}), DEPLOY_ENV: f"https://{DEPLOY_ENV}.aisdlc.internal"},
-            "current_stage":  "deploy",
+            "deployment_config": result,
+            "deploy_status":     deploy_status,
+            "deploy_history":    deploy_history,
+            "env_urls":          {**state.get("env_urls", {}), DEPLOY_ENV: f"https://{DEPLOY_ENV}.aisdlc.internal"},
+            "current_stage":     "deploy",
         }

@@ -1,35 +1,35 @@
 """sdlc_orchestrator/agents/implementation_agent.py
-Generates code files across repos for each story, pushes branches, opens PRs.
+ReAct agent: generates code and pushes it to GitHub via MCP tools.
+Tools: GitHub MCP (create_branch, push_file, create_pull_request, ...)
 """
-import re
 import json
-from langchain_core.messages import HumanMessage
+import re
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.prebuilt import create_react_agent
 
 from sdlc_orchestrator.state import SDLCState
 from sdlc_orchestrator.memory.shared_memory import SharedMemory
 from sdlc_orchestrator.providers.provider_factory import ProviderFactory, AgentRole
 from sdlc_orchestrator.monitoring.tracker import EventType, emit, track_stage
-from sdlc_orchestrator.tools.github_tools import (
-    create_branch, upsert_file, create_pull_request,
-)
-from sdlc_orchestrator.tools.jira_tools import update_story_status
+from sdlc_orchestrator.mcp.client import mcp_manager
 
-SYSTEM_PROMPT = """You are a Senior Full-Stack Engineer.
-Implement the user story below following the conventions provided.
-Output ONLY file blocks in this exact format (repeat for each file):
+SYSTEM_PROMPT = """You are a Senior Full-Stack Engineer with access to GitHub tools.
 
-FILE: path/to/file.ext
-```lang
-<full file contents>
-```
+Your task for EACH story:
+1. Create a feature branch named feature/{jira-key}-implementation in the appropriate repo
+2. Generate complete, production-ready code covering all acceptance criteria
+3. Push each file to the branch using your GitHub tools
+4. Open a pull request
 
-Cover all acceptance criteria. Include necessary imports. Do not truncate."""
+GitHub owner: bhaskarmca83
+Repos: aisdlc-backend (Spring Boot/Java), aisdlc-frontend (React), aisdlc-infra (Terraform)
 
-
-def parse_file_blocks(content: str) -> list[tuple[str, str, str]]:
-    pattern = r"FILE:\s*(.+?)\n```(\w+)?\n(.*?)```"
-    matches = re.findall(pattern, content, re.DOTALL)
-    return [(path.strip(), lang or "text", code.strip()) for path, lang, code in matches]
+After completing all stories, respond with JSON:
+{
+  "files_changed": [{"repo": "...", "path": "...", "branch": "..."}],
+  "feature_branches": {"repo-name": "branch-name"},
+  "pull_requests": [{"repo": "...", "number": 0, "url": "..."}]
+}"""
 
 
 def resolve_repos(story: dict) -> list[str]:
@@ -51,117 +51,73 @@ async def implementation_agent_node(state: SDLCState) -> SDLCState:
 
         mem = SharedMemory(state["project_id"])
         await mem.init()
-
-        ctx       = await mem.get_project_context()
         learnings = await mem.get_accumulated_learnings(limit=5)
+
+        llm   = ProviderFactory.get_model(AgentRole.IMPLEMENTATION)
+        tools = mcp_manager.get_tools_for_agent("implement")
 
         stories = state.get("stories", [])
         if not stories:
-            raise ValueError("No stories available for implementation")
+            raise ValueError("No stories for implementation")
 
-        llm          = ProviderFactory.get_model(AgentRole.IMPLEMENTATION)
-        all_files    = []
-        feature_branches: dict[str, str] = dict(state.get("feature_branches", {}))
+        conventions  = json.dumps(state.get("code_conventions", {}), indent=2)
+        api_ctx      = json.dumps(state.get("api_contracts", [])[:5], indent=2)
+        learning_ctx = json.dumps([l["content"] for l in learnings[:3]], indent=2) if learnings else ""
 
-        conventions = json.dumps(state.get("code_conventions", {}), indent=2)
-        api_ctx     = json.dumps(state.get("api_contracts", [])[:5], indent=2)
+        stories_text = "\n\n".join(
+            f"Story: [{s.get('jira_key','N/A')}] {s.get('summary','')}\n"
+            f"Description: {s.get('description','')}\n"
+            f"AC: {'; '.join(s.get('acceptance_criteria',[]))}\n"
+            f"Repos: {', '.join(resolve_repos(s))}"
+            for s in stories
+        )
 
-        learning_ctx = ""
-        if learnings:
-            learning_ctx = "\nPrevious patterns:\n" + json.dumps(
-                [l["content"] for l in learnings[:3]], indent=2
-            )
+        user_message = (
+            f"Tech stack: {', '.join(state.get('tech_stack', []))}\n"
+            f"Code conventions:\n{conventions}\n"
+            f"API contracts:\n{api_ctx}\n\n"
+            f"Stories to implement:\n{stories_text}\n"
+            + (f"\nPrevious patterns:\n{learning_ctx}" if learning_ctx else "")
+        )
 
-        for story in stories:
-            story_key  = story.get("jira_key", story["summary"][:20].replace(" ", "-"))
-            repos      = resolve_repos(story)
-            branch_name = f"feature/{story_key.lower()}-implementation"
+        if tools:
+            emit(EventType.TOOL, f"Using {len(tools)} GitHub MCP tools")
+            agent    = create_react_agent(llm, tools)
+            response = await agent.ainvoke({
+                "messages": [
+                    SystemMessage(content=SYSTEM_PROMPT),
+                    HumanMessage(content=user_message),
+                ]
+            })
+            raw = response["messages"][-1].content
+        else:
+            emit(EventType.INFO, "No GitHub MCP tools — generating code only (no push)")
+            response = await llm.ainvoke([
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content=user_message),
+            ])
+            raw = response.content
 
-            emit(EventType.INFO, f"Implementing [{story_key}]: {story['summary'][:60]}")
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            result = json.loads(m.group()) if m else {}
 
-            prompt = (
-                f"{SYSTEM_PROMPT}{learning_ctx}\n\n"
-                f"Story: {story['summary']}\n"
-                f"Description: {story.get('description', '')}\n"
-                f"Acceptance Criteria:\n" + "\n".join(f"- {ac}" for ac in story.get("acceptance_criteria", [])) +
-                f"\n\nTargets repos: {', '.join(repos)}\n"
-                f"Tech stack: {', '.join(state.get('tech_stack', []))}\n"
-                f"Conventions:\n{conventions}\n"
-                f"API contracts:\n{api_ctx}"
-            )
-
-            emit(EventType.LLM, f"Calling LLM for [{story_key}]")
-            response   = await llm.ainvoke([HumanMessage(content=prompt)])
-            raw        = response.content
-            file_blocks = parse_file_blocks(raw)
-
-            emit(EventType.INFO, f"Parsed {len(file_blocks)} file(s) for [{story_key}]")
-
-            for repo in repos:
-                try:
-                    await create_branch(repo, branch_name)
-                    feature_branches[repo] = branch_name
-                    emit(EventType.TOOL, f"Created branch {branch_name} in {repo}")
-                except Exception as e:
-                    emit(EventType.ERROR, f"Branch creation failed for {repo}: {e}")
-
-            for path, lang, code in file_blocks:
-                # Route file to correct repo based on path prefix
-                target_repo = repos[0]
-                if "frontend" in path or "src/" in path and "java" not in path:
-                    target_repo = "aisdlc-frontend" if "aisdlc-frontend" in repos else repos[0]
-                elif "java" in path or "src/main" in path:
-                    target_repo = "aisdlc-backend" if "aisdlc-backend" in repos else repos[0]
-                elif ".tf" in path or "helm" in path:
-                    target_repo = "aisdlc-infra" if "aisdlc-infra" in repos else repos[0]
-
-                try:
-                    await upsert_file(
-                        repo=target_repo,
-                        path=path,
-                        content=code,
-                        branch=feature_branches.get(target_repo, branch_name),
-                        message=f"feat({story_key}): {story['summary'][:72]}",
-                    )
-                    all_files.append({"repo": target_repo, "path": path, "story": story_key})
-                    emit(EventType.TOOL, f"Pushed {path} → {target_repo}")
-                except Exception as e:
-                    emit(EventType.ERROR, f"File push failed {path}: {e}")
-
-            # Open PRs
-            for repo in repos:
-                branch = feature_branches.get(repo, branch_name)
-                try:
-                    pr = await create_pull_request(
-                        repo=repo,
-                        title=f"[{story_key}] {story['summary'][:72]}",
-                        body=f"Implements {story_key}\n\n{story.get('description', '')}",
-                        head=branch,
-                    )
-                    emit(EventType.TOOL, f"Opened PR #{pr.get('number')} in {repo}")
-                except Exception as e:
-                    emit(EventType.ERROR, f"PR creation failed for {repo}: {e}")
-
-            # Transition story to In Progress
-            if story.get("jira_key"):
-                try:
-                    await update_story_status(story["jira_key"], "In Progress")
-                except Exception:
-                    pass
+        files_changed    = result.get("files_changed", [])
+        feature_branches = result.get("feature_branches", {})
 
         await mem.save_story_learning({
-            "story_id":     state.get("current_story_id", ""),
-            "agent_name":   "implementation",
-            "learning_type":"files_generated",
-            "content":      {"file_count": len(all_files), "repos": list(feature_branches.keys())},
-            "metadata":     {},
+            "story_id": state.get("current_story_id", ""), "agent_name": "implementation",
+            "learning_type": "files_generated",
+            "content": {"file_count": len(files_changed)}, "metadata": {},
         })
 
-        emit(EventType.DONE, f"Implementation complete: {len(all_files)} file(s) across {len(feature_branches)} repo(s)")
-
+        emit(EventType.DONE, f"Implementation complete: {len(files_changed)} file(s)")
         return {
             **state,
-            "files_changed":   all_files,
+            "files_changed":    files_changed,
             "feature_branches": feature_branches,
-            "current_stage":   "implement",
+            "current_stage":    "implement",
+            "retry_count":      state.get("retry_count", 0) + 1,
         }

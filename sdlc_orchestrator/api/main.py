@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from sdlc_orchestrator.graph import graph
 from sdlc_orchestrator.state import SDLCState
 from sdlc_orchestrator.monitoring.tracker import init_tracker, EventType, emit
+from sdlc_orchestrator.mcp.client import mcp_manager
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
@@ -34,10 +35,19 @@ redis: aioredis.Redis = None  # type: ignore
 async def startup():
     global redis
     redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        await mcp_manager.start()
+    except Exception as e:
+        # MCP servers are optional — log but don't block startup
+        print(f"[startup] MCP manager failed to start (tools unavailable): {e}")
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    try:
+        await mcp_manager.stop()
+    except Exception:
+        pass
     if redis:
         await redis.aclose()
 
