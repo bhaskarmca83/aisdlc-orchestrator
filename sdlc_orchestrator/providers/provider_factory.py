@@ -42,14 +42,23 @@ AGENT_MODEL_MAP = {
     AgentRole.E2E:            ModelConfig(Provider.VERTEX,  "gemini-1.5-pro-002",   fallback_provider=Provider.ANTHROPIC, fallback_model="claude-3-5-sonnet-20241022"),
 }
 
-# If ANTHROPIC_API_KEY is set, route all agents through it directly
-# (bypasses cloud providers — good for local dev / demos)
+# Priority: OLLAMA_MODEL > ANTHROPIC_API_KEY > cloud providers
+def _use_ollama_direct() -> bool:
+    return bool(os.environ.get("OLLAMA_MODEL"))
+
 def _use_anthropic_direct() -> bool:
     return bool(os.environ.get("ANTHROPIC_API_KEY"))
 
 class ProviderFactory:
     @staticmethod
     def get_model(role: AgentRole):
+        if _use_ollama_direct():
+            return ProviderFactory._build(
+                Provider.OLLAMA,
+                os.environ["OLLAMA_MODEL"],
+                AGENT_MODEL_MAP[role].temperature,
+                AGENT_MODEL_MAP[role].max_tokens,
+            )
         if _use_anthropic_direct():
             return ProviderFactory._build_anthropic(
                 AGENT_MODEL_MAP[role].fallback_model,
@@ -85,5 +94,6 @@ class ProviderFactory:
                 return ChatVertexAI(model=model, temperature=temperature, max_output_tokens=max_tokens,
                                     project=os.environ["GCP_PROJECT_ID"])
             case Provider.OLLAMA:
-                from langchain_community.chat_models import ChatOllama
-                return ChatOllama(model=model, temperature=temperature)
+                from langchain_ollama import ChatOllama
+                base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+                return ChatOllama(model=model, temperature=temperature, base_url=base_url)
