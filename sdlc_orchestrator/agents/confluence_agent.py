@@ -52,23 +52,23 @@ async def confluence_agent_node(state: SDLCState) -> SDLCState:
             f"Previous learnings:\n{learning_ctx}" if learning_ctx else ""
         )
 
-        if tools:
-            emit(EventType.TOOL, f"Using {len(tools)} Atlassian MCP tools")
-            agent    = create_react_agent(llm, tools)
-            response = await agent.ainvoke({
-                "messages": [
-                    SystemMessage(content=SYSTEM_PROMPT),
-                    HumanMessage(content=user_message),
-                ]
-            })
-            raw = response["messages"][-1].content
-        else:
-            emit(EventType.INFO, "No Atlassian MCP tools — using LLM only")
-            response = await llm.ainvoke([
-                SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(content=user_message),
-            ])
-            raw = response.content
+        # Phase 1: fetch existing page if URL provided, else extract from idea text
+        if tools and page_url:
+            fetch_tool = next((t for t in tools if "get" in t.name.lower() and "page" in t.name.lower()), None)
+            if fetch_tool:
+                emit(EventType.TOOL, "Fetching existing Confluence page")
+                try:
+                    page_content = await fetch_tool.ainvoke({"url": page_url})
+                    user_message = f"Confluence page content:\n{page_content}\n\nIdea text:\n{idea_text}"
+                except Exception as e:
+                    emit(EventType.ERROR, f"Failed to fetch page: {e}")
+
+        emit(EventType.INFO, "Extracting requirements from idea text with LLM")
+        response = await llm.ainvoke([
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=user_message),
+        ])
+        raw = response.content
 
         emit(EventType.LLM, f"LLM response: {len(raw)} chars")
 
@@ -78,6 +78,26 @@ async def confluence_agent_node(state: SDLCState) -> SDLCState:
             import re
             m = re.search(r"\{.*\}", raw, re.DOTALL)
             parsed = json.loads(m.group()) if m else {}
+
+        # Phase 2: create requirements page in Confluence if not already there
+        confluence_page_id = parsed.get("confluence_page_id", "")
+        if tools and not page_url:
+            create_tool = next(
+                (t for t in tools if "create" in t.name.lower() and "page" in t.name.lower()), None
+            )
+            if create_tool:
+                req_body = "\n".join(f"<li>{r}</li>" for r in parsed.get("requirements", []))
+                try:
+                    result = await create_tool.ainvoke({
+                        "space_key":  "SD",
+                        "parent_id":  "50200578",
+                        "title":      f"{parsed.get('project_name', state.get('project_name', 'Project'))} — Requirements",
+                        "content":    f"<h2>Requirements</h2><ul>{req_body}</ul>",
+                    })
+                    confluence_page_id = result.get("id", "") if isinstance(result, dict) else ""
+                    emit(EventType.TOOL, f"Created Confluence requirements page id={confluence_page_id}")
+                except Exception as e:
+                    emit(EventType.ERROR, f"Confluence page creation failed: {e}")
 
         await mem.update_project_context({
             "project_name":           parsed.get("project_name", state.get("project_name", "")),
@@ -103,5 +123,6 @@ async def confluence_agent_node(state: SDLCState) -> SDLCState:
             "architecture_decisions": parsed.get("architecture_decisions", []),
             "api_contracts":          parsed.get("api_contracts", []),
             "code_conventions":       parsed.get("code_conventions", {}),
+            "confluence_page_url":    confluence_page_id or page_url,
             "current_stage":          "confluence",
         }

@@ -80,29 +80,42 @@ async def story_agent_node(state: SDLCState) -> SDLCState:
             + (f"\nPrevious patterns:\n{learning_ctx}" if learning_ctx else "")
         )
 
-        if tools:
-            emit(EventType.TOOL, f"Using {len(tools)} Atlassian MCP tools (will create Jira stories)")
-            agent    = create_react_agent(llm, tools)
-            response = await agent.ainvoke({
-                "messages": [
-                    SystemMessage(content=SYSTEM_PROMPT),
-                    HumanMessage(content=user_message),
-                ]
-            })
-            raw = response["messages"][-1].content
-        else:
-            emit(EventType.INFO, "No Atlassian MCP tools — generating stories without Jira")
-            response = await llm.ainvoke([
-                SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(content=user_message),
-            ])
-            raw = response.content
+        # Phase 1: LLM generates stories (no tools — small models can't handle 73 tools)
+        emit(EventType.INFO, "Generating stories with LLM")
+        response = await llm.ainvoke([
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=user_message),
+        ])
+        raw = response.content
 
         try:
             stories = json.loads(raw)
         except json.JSONDecodeError:
             m = re.search(r"\[.*\]", raw, re.DOTALL)
             stories = json.loads(m.group()) if m else []
+
+        # Phase 2: Create stories in Jira via targeted tool calls
+        if tools and stories:
+            create_tool = next(
+                (t for t in tools if "create" in t.name.lower() and "issue" in t.name.lower()), None
+            )
+            if create_tool:
+                emit(EventType.TOOL, f"Creating {len(stories)} Jira issues via MCP")
+                for story in stories:
+                    try:
+                        result = await create_tool.ainvoke({
+                            "project_key": "CTS",
+                            "summary":     story.get("summary", ""),
+                            "description": story.get("description", ""),
+                            "issue_type":  "Story",
+                            "parent_key":  story.get("epic", "CTS-130"),
+                        })
+                        if isinstance(result, dict) and result.get("key"):
+                            story["jira_key"] = result["key"]
+                    except Exception as e:
+                        emit(EventType.ERROR, f"Jira create failed for '{story.get('summary','')[:40]}': {e}")
+            else:
+                emit(EventType.INFO, "No Jira create-issue tool found — skipping Jira sync")
 
         for story in stories:
             if not story.get("repos"):
