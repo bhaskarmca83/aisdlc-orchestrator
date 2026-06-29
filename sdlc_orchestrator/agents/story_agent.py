@@ -3,9 +3,9 @@ ReAct agent: converts requirements into Jira stories and assigns repos.
 Tools: Atlassian MCP (create_jira_issue, search_jira_issues, ...)
 """
 import json
+import os
 import re
 from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.prebuilt import create_react_agent
 
 from sdlc_orchestrator.state import SDLCState
 from sdlc_orchestrator.memory.shared_memory import SharedMemory
@@ -13,34 +13,29 @@ from sdlc_orchestrator.providers.provider_factory import ProviderFactory, AgentR
 from sdlc_orchestrator.monitoring.tracker import EventType, emit, track_stage
 from sdlc_orchestrator.mcp.client import mcp_manager
 
-SYSTEM_PROMPT = """You are a Senior Product Manager with access to Jira tools.
+SYSTEM_PROMPT = """You are a Senior Product Manager. Convert requirements into Jira user stories.
 
-Your task:
-1. Convert the requirements into actionable Jira user stories
-2. Create each story in Jira under the appropriate epic using your Jira tools
-   - Epics: CTS-129 (Platform Foundation), CTS-130 (Agent Implementation),
-            CTS-131 (Monitoring Dashboard), CTS-132 (Infrastructure)
-   - Project key: CTS
-3. After creating stories in Jira, respond with a JSON array of stories created:
+Output a JSON array ONLY — no prose, no markdown fences, just the raw JSON array:
 
 [
   {
-    "jira_key": "CTS-XXX",
+    "jira_key": "PROJ-TBD",
     "summary": "As a ... I want ... so that ...",
-    "description": "...",
+    "description": "Detailed description of the story.",
     "story_points": 3,
     "tags": ["backend", "api"],
     "acceptance_criteria": ["Given...", "When...", "Then..."],
-    "epic": "CTS-130",
     "repos": ["aisdlc-backend"]
   }
 ]
 
-Tag rules for repos:
-- tags ["api","backend"] or acceptance criteria mentions "database" → aisdlc-backend
-- tags ["ui","frontend"] or AC mentions "screen","page","form" → aisdlc-frontend
-- tags ["infra","terraform"] or AC mentions "deploy" → aisdlc-infra
-- default → aisdlc-backend"""
+Rules:
+- Generate 2–5 stories maximum; keep them focused and concrete.
+- tags ["api","backend"] or acceptance criteria mentions "database" → repos: ["aisdlc-backend"]
+- tags ["ui","frontend"] or AC mentions "screen","page","form" → repos: ["aisdlc-frontend"]
+- tags ["infra","terraform"] or AC mentions "deploy" → repos: ["aisdlc-infra"]
+- default → repos: ["aisdlc-backend"]
+- story_points must be one of: 1, 2, 3, 5, 8"""
 
 
 def resolve_repos(story: dict) -> list[str]:
@@ -94,28 +89,43 @@ async def story_agent_node(state: SDLCState) -> SDLCState:
             m = re.search(r"\[.*\]", raw, re.DOTALL)
             stories = json.loads(m.group()) if m else []
 
+        # Resolve the target Jira project for THIS run
+        jira_project = state.get("target_jira_project", "").strip() or os.environ.get("JIRA_PROJECT_KEY", "")
+        if not jira_project:
+            emit(EventType.ERROR,
+                 "No Jira project key provided. Set jira_project_key in the run request. "
+                 "Stories will be generated in-memory only.")
+
         # Phase 2: Create stories in Jira via targeted tool calls
-        if tools and stories:
+        jira_synced = 0
+        jira_failed = 0
+        if tools and stories and jira_project:
             create_tool = next(
                 (t for t in tools if "create" in t.name.lower() and "issue" in t.name.lower()), None
             )
             if create_tool:
-                emit(EventType.TOOL, f"Creating {len(stories)} Jira issues via MCP")
+                emit(EventType.TOOL, f"Creating {len(stories)} Jira issues in {jira_project} via MCP")
                 for story in stories:
                     try:
                         result = await create_tool.ainvoke({
-                            "project_key": "CTS",
+                            "project_key": jira_project,
                             "summary":     story.get("summary", ""),
                             "description": story.get("description", ""),
                             "issue_type":  "Story",
-                            "parent_key":  story.get("epic", "CTS-130"),
                         })
                         if isinstance(result, dict) and result.get("key"):
                             story["jira_key"] = result["key"]
+                            jira_synced += 1
+                        else:
+                            jira_failed += 1
+                            emit(EventType.ERROR, f"Jira returned no key for '{story.get('summary','')[:40]}'")
                     except Exception as e:
-                        emit(EventType.ERROR, f"Jira create failed for '{story.get('summary','')[:40]}': {e}")
+                        jira_failed += 1
+                        emit(EventType.ERROR, f"Jira create failed: {e}")
             else:
-                emit(EventType.INFO, "No Jira create-issue tool found — skipping Jira sync")
+                emit(EventType.INFO, "No Jira create-issue tool found — stories generated in-memory only")
+        else:
+            emit(EventType.INFO, "No MCP tools available — stories generated in-memory only")
 
         for story in stories:
             if not story.get("repos"):
@@ -126,7 +136,15 @@ async def story_agent_node(state: SDLCState) -> SDLCState:
             for s in stories
         ]
 
-        emit(EventType.DONE, f"Created {len(stories)} stories")
+        if jira_failed > 0 and jira_synced == 0:
+            emit(EventType.ERROR,
+                 f"Jira sync FAILED for all {jira_failed} stories — check JIRA_BASE_URL and project key. "
+                 f"Stories exist in pipeline memory only.")
+        elif jira_failed > 0:
+            emit(EventType.INFO,
+                 f"{jira_synced} stories synced to Jira, {jira_failed} failed.")
+        else:
+            emit(EventType.DONE, f"{len(stories)} stories created in Jira project {jira_project}")
         await mem.save_story_learning({
             "story_id": state.get("current_story_id", ""), "agent_name": "story",
             "learning_type": "stories_generated",

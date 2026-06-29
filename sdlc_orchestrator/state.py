@@ -6,6 +6,9 @@ from typing import Any, TypedDict, Optional
 class SDLCState(TypedDict):
     project_id: str
     project_name: str
+    # Target Jira project and Confluence space for THIS run (not the AISDLC platform's own)
+    target_jira_project: str        # e.g. "CTS" for aisdlc-backend work
+    target_confluence_space: str    # e.g. "CCT" for that project's docs
     tech_stack: list[str]
     code_conventions: dict[str, Any]
     architecture_decisions: list[dict]

@@ -3,8 +3,8 @@ ReAct agent: reads a Confluence idea page and extracts structured requirements.
 Tools: Atlassian MCP (confluence_search, get_confluence_page, ...)
 """
 import json
+import os
 from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.prebuilt import create_react_agent
 
 from sdlc_orchestrator.state import SDLCState
 from sdlc_orchestrator.memory.shared_memory import SharedMemory
@@ -86,13 +86,17 @@ async def confluence_agent_node(state: SDLCState) -> SDLCState:
                 (t for t in tools if "create" in t.name.lower() and "page" in t.name.lower()), None
             )
             if create_tool:
-                req_body = "\n".join(f"<li>{r}</li>" for r in parsed.get("requirements", []))
+                # Use the space provided at runtime; fall back to env default (SD = platform space)
+                space_key   = state.get("target_confluence_space", "").strip() \
+                              or os.environ.get("CONFLUENCE_SPACE_KEY", "SD")
+                parent_page = os.environ.get("CONFLUENCE_PARENT_PAGE", "524458")
+                req_body    = "\n".join(f"<li>{r}</li>" for r in parsed.get("requirements", []))
                 try:
                     result = await create_tool.ainvoke({
-                        "space_key":  "SD",
-                        "parent_id":  "50200578",
-                        "title":      f"{parsed.get('project_name', state.get('project_name', 'Project'))} — Requirements",
-                        "content":    f"<h2>Requirements</h2><ul>{req_body}</ul>",
+                        "space_key": space_key,
+                        "parent_id": parent_page,
+                        "title":     f"{parsed.get('project_name', state.get('project_name', 'Project'))} — Requirements",
+                        "content":   f"<h2>Requirements</h2><ul>{req_body}</ul>",
                     })
                     confluence_page_id = result.get("id", "") if isinstance(result, dict) else ""
                     emit(EventType.TOOL, f"Created Confluence requirements page id={confluence_page_id}")

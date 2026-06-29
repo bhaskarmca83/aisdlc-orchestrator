@@ -16,10 +16,16 @@ from sdlc_orchestrator.graph import graph
 from sdlc_orchestrator.state import SDLCState
 from sdlc_orchestrator.monitoring.tracker import init_tracker, EventType, emit
 from sdlc_orchestrator.mcp.client import mcp_manager
+from sdlc_orchestrator.api.projects import router as projects_router, init_project_router, _load as _load_project
+from sdlc_orchestrator.api.profiles import router as profiles_router, init_profiles_router
+from sdlc_orchestrator.api.validate  import router as validate_router
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
 app = FastAPI(title="AI SDLC Orchestrator", version="1.0.0")
+app.include_router(projects_router)
+app.include_router(profiles_router)
+app.include_router(validate_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,6 +41,8 @@ redis: aioredis.Redis = None  # type: ignore
 async def startup():
     global redis
     redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+    init_project_router(redis)
+    init_profiles_router(redis)
     try:
         await mcp_manager.start()
     except Exception as e:
@@ -55,9 +63,12 @@ async def shutdown():
 
 class RunRequest(BaseModel):
     idea: str
-    project_id: str = ""
-    project_name: str = "SDLC Project"
+    project_config_id: str = ""      # registered team project — preferred
+    # fallback: manual override (used when no project config is registered)
+    project_name: str = ""
     confluence_page_url: str = ""
+    jira_project_key: str = ""
+    confluence_space_key: str = ""
 
 class ApproveRequest(BaseModel):
     approved: bool = True
@@ -69,19 +80,40 @@ class ApproveRequest(BaseModel):
 @app.post("/api/pipeline/run")
 async def run_pipeline(req: RunRequest):
     execution_id = str(uuid.uuid4())
-    project_id   = req.project_id or str(uuid.uuid4())
+
+    # Load team project config if a registered config ID was provided
+    proj_cfg = None
+    if req.project_config_id:
+        proj_cfg = await _load_project(req.project_config_id)
+        if not proj_cfg:
+            raise HTTPException(status_code=404,
+                                detail=f"Project config '{req.project_config_id}' not found. Register it first via POST /api/projects")
+
+    project_id           = proj_cfg["id"]       if proj_cfg else str(uuid.uuid4())
+    project_name         = proj_cfg["name"]      if proj_cfg else (req.project_name or "SDLC Project")
+    jira_project_key     = proj_cfg["jira_project_key"]     if proj_cfg else req.jira_project_key
+    confluence_space_key = proj_cfg["confluence_space_key"] if proj_cfg else req.confluence_space_key
+
+    if not jira_project_key or not confluence_space_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Either provide project_config_id (registered team project) or both "
+                   "jira_project_key and confluence_space_key explicitly."
+        )
 
     init_tracker(execution_id, story_id="")
 
     initial_state: SDLCState = {
         "project_id":             project_id,
-        "project_name":           req.project_name,
+        "project_name":           project_name,
+        "target_jira_project":    jira_project_key,
+        "target_confluence_space": confluence_space_key,
         "tech_stack":             [],
         "code_conventions":       {},
         "architecture_decisions": [],
         "api_contracts":          [],
         "test_framework":         "pytest",
-        "repo_registry":          [],
+        "repo_registry":          proj_cfg.get("repos", []) if proj_cfg else [],
         "env_urls":               {},
         "current_story_id":       "",
         "current_epic_id":        "",
@@ -175,16 +207,38 @@ async def _run_graph(execution_id: str, state: SDLCState, config: dict):
 
 # ─── Gate helpers ─────────────────────────────────────────────────────────────
 
+_JIRA_BASE = os.environ.get("JIRA_BASE_URL", "https://bhaskarwork.atlassian.net")
+_JIRA_PROJ = os.environ.get("JIRA_PROJECT_KEY", "AISDLC")
+_CONF_BASE = os.environ.get("CONFLUENCE_BASE_URL", "https://bhaskarwork.atlassian.net/wiki")
+
+
 def _gate_message(gate: str, values: dict) -> str:
     if gate == "po_gate":
         stories = values.get("stories", [])
-        return (f"PO Review: {len(stories)} stories created. "
-                f"Review them in Jira and approve to proceed to Technical Design.")
+        jira_url = f"{_JIRA_BASE}/jira/software/projects/{_JIRA_PROJ}/boards"
+        # Check whether stories are real (non-TBD Jira keys) or in-memory only
+        real = [s for s in stories if s.get("jira_key") and "-TBD" not in s.get("jira_key", "")]
+        lines = [f"PO Review — {len(stories)} stories generated:"]
+        for s in stories:
+            key  = s.get("jira_key", "?")
+            summ = s.get("summary", "")[:80]
+            pts  = s.get("story_points", "?")
+            if "-TBD" not in key and key != "?":
+                lines.append(f"  [{key}] ({pts}pts) {summ}")
+            else:
+                lines.append(f"  [in-memory] ({pts}pts) {summ}")
+        if real:
+            lines.append(f"\nView in Jira: {jira_url}")
+        else:
+            lines.append("\n⚠️  Jira sync failed — stories are in pipeline memory only. Check server logs.")
+        lines.append("\nApprove to proceed to Technical Design.")
+        return "\n".join(lines)
     if gate == "arch_gate":
-        tsd_id = values.get("confluence_tsd_page_id", "")
-        page_url = (f"https://bhaskarmca83.atlassian.net/wiki/spaces/SD/pages/{tsd_id}"
-                    if tsd_id else "Confluence SD space")
-        return f"Architect Review: Technical Design doc ready at {page_url}. Approve to start implementation."
+        tsd_id   = values.get("confluence_tsd_page_id", "")
+        page_url = (f"{_CONF_BASE}/spaces/SD/pages/{tsd_id}"
+                    if tsd_id else f"{_CONF_BASE}/spaces/SD")
+        return (f"Architect Review: Technical Design doc ready at {page_url}.\n"
+                f"Approve to start implementation.")
     return "Awaiting approval"
 
 
