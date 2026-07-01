@@ -62,5 +62,9 @@ class SDLCState(TypedDict):
     execution_id: str
     current_stage: str
     stage_timings: dict[str, float]
+    # Pipeline entry classification (set by intake_agent)
+    entry_type: str          # "fresh_idea" | "existing_story" | "defect" | "spike"
+    # Execution methodology detected from Jira board at project registration
+    methodology: str         # "scrum" | "kanban" | "other"
     error: Optional[str]
     retry_count: int

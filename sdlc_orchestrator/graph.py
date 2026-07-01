@@ -1,8 +1,13 @@
 """sdlc_orchestrator/graph.py
-LangGraph topology — full SDLC flow with revision loops and two-tier E2E:
-  confluence → stories → [PO Gate] → design → [Arch Gate]
-  → implement → test → review
-  → deploy_local → e2e_local → deploy_cloud → e2e_cloud
+LangGraph topology — intake-classified SDLC flow with revision loops and two-tier E2E.
+
+Intake classifies the input and routes to the right entry stage:
+  fresh_idea      → confluence → stories → [PO Gate] → design → [Arch Gate] → ...
+  existing_story  → design → [Arch Gate] → implement → ...
+  spike           → design → [Arch Gate] → implement → ...
+  defect          → implement → test → review → ...
+
+All paths converge at: implement → test → review → deploy_local → e2e_local → deploy_cloud → e2e_cloud
 
 Gates default to REJECT when payload is absent.
 PO rejection loops back to stories; arch rejection loops back to design.
@@ -13,6 +18,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
 from sdlc_orchestrator.state import SDLCState
+from sdlc_orchestrator.agents.intake_agent           import intake_agent_node
 from sdlc_orchestrator.agents.confluence_agent      import confluence_agent_node
 from sdlc_orchestrator.agents.story_agent           import story_agent_node
 from sdlc_orchestrator.agents.design_agent          import design_agent_node
@@ -26,6 +32,21 @@ from sdlc_orchestrator.agents.e2e_cloud_agent       import e2e_cloud_agent_node
 from sdlc_orchestrator.monitoring.tracker           import EventType, emit
 
 MAX_RETRY = int(os.environ.get("AGENT_MAX_RETRY", "2"))
+
+
+# ─── Intake routing ───────────────────────────────────────────────────────────
+
+def route_after_intake(state: SDLCState) -> str:
+    entry_type = state.get("entry_type", "fresh_idea")
+    routes = {
+        "fresh_idea":      "confluence",
+        "existing_story":  "design",
+        "spike":           "design",
+        "defect":          "implement",
+    }
+    dest = routes.get(entry_type, "confluence")
+    emit(EventType.ROUTE, f"Entry type '{entry_type}' → starting at '{dest}'")
+    return dest
 
 
 # ─── Gate nodes ───────────────────────────────────────────────────────────────
@@ -133,6 +154,8 @@ checkpointer = MemorySaver()
 def build_graph():
     builder = StateGraph(SDLCState)
 
+    # ── Nodes ──────────────────────────────────────────────────────────────────
+    builder.add_node("intake",        intake_agent_node)
     builder.add_node("confluence",    confluence_agent_node)
     builder.add_node("stories",       story_agent_node)
     builder.add_node("po_gate",       po_gate_node)
@@ -146,21 +169,41 @@ def build_graph():
     builder.add_node("deploy_cloud",  deploy_cloud_agent_node)
     builder.add_node("e2e_cloud",     e2e_cloud_agent_node)
 
-    builder.set_entry_point("confluence")
+    # ── Entry: intake classifies and routes ────────────────────────────────────
+    builder.set_entry_point("intake")
+    builder.add_conditional_edges(
+        "intake", route_after_intake,
+        {
+            "confluence": "confluence",
+            "design":     "design",
+            "implement":  "implement",
+        },
+    )
+
+    # ── Fresh-idea path: confluence → stories → PO gate ───────────────────────
     builder.add_edge("confluence", "stories")
     builder.add_edge("stories",    "po_gate")
+    builder.add_conditional_edges("po_gate", route_after_po_gate,
+                                  {"design": "design", "stories": "stories"})
 
-    builder.add_conditional_edges("po_gate",   route_after_po_gate,   {"design": "design",     "stories": "stories"})
+    # ── Design → Arch gate (shared by fresh_idea / existing_story / spike) ────
     builder.add_edge("design", "arch_gate")
-    builder.add_conditional_edges("arch_gate", route_after_arch_gate, {"implement": "implement", "design": "design"})
+    builder.add_conditional_edges("arch_gate", route_after_arch_gate,
+                                  {"implement": "implement", "design": "design"})
 
+    # ── Implement → test → review (shared by all paths) ───────────────────────
     builder.add_edge("implement", "test")
-    builder.add_conditional_edges("test",   route_after_test,         {"review": "review",       "implement": "implement"})
-    builder.add_conditional_edges("review", route_after_review,       {"deploy_local": "deploy_local", "implement": "implement"})
+    builder.add_conditional_edges("test",   route_after_test,
+                                  {"review": "review", "implement": "implement"})
+    builder.add_conditional_edges("review", route_after_review,
+                                  {"deploy_local": "deploy_local", "implement": "implement"})
 
+    # ── Two-tier E2E ───────────────────────────────────────────────────────────
     builder.add_edge("deploy_local", "e2e_local")
-    builder.add_conditional_edges("e2e_local",    route_after_e2e_local,    {"deploy_cloud": "deploy_cloud", END: END})
-    builder.add_conditional_edges("deploy_cloud", route_after_deploy_cloud, {"e2e_cloud": "e2e_cloud",       END: END})
+    builder.add_conditional_edges("e2e_local",    route_after_e2e_local,
+                                  {"deploy_cloud": "deploy_cloud", END: END})
+    builder.add_conditional_edges("deploy_cloud", route_after_deploy_cloud,
+                                  {"e2e_cloud": "e2e_cloud", END: END})
     builder.add_edge("e2e_cloud", END)
 
     return builder.compile(

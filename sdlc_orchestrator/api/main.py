@@ -31,6 +31,7 @@ REDIS_URL      = os.environ.get("REDIS_URL",      "redis://localhost:6379")
 FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "http://localhost:5173")
 
 PIPELINE_NODES = {
+    "intake",
     "confluence", "stories", "po_gate", "design", "arch_gate",
     "implement", "test", "review",
     "deploy_local", "e2e_local", "deploy_cloud", "e2e_cloud",
@@ -178,6 +179,8 @@ async def run_pipeline(req: RunRequest, _: None = Depends(verify_request)):
         "e2e_cloud_results":      {},
         "po_revision_reason":     None,
         "arch_revision_reason":   None,
+        "entry_type":             "",   # set by intake_agent
+        "methodology":            proj_cfg.get("methodology", "scrum") if proj_cfg else "scrum",
         "execution_id":           execution_id,
         "current_stage":          "init",
         "stage_timings":          {},

@@ -2,10 +2,13 @@
 Team project registry — each team registers their config once.
 Stored in Redis under project:config:{id}.
 """
+import base64
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 
+import httpx
 import redis.asyncio as aioredis
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -39,7 +42,35 @@ class ProjectConfigCreate(BaseModel):
 
 class ProjectConfig(ProjectConfigCreate):
     id: str
+    methodology: str = "scrum"
     created_at: str
+
+
+# ─── Methodology detection ────────────────────────────────────────────────────
+
+async def _detect_methodology(jira_project_key: str) -> str:
+    """Query Jira Agile board API to determine scrum vs kanban for a project."""
+    base_url = os.environ.get("JIRA_BASE_URL", "").rstrip("/")
+    email    = os.environ.get("JIRA_EMAIL", "")
+    token    = os.environ.get("JIRA_API_TOKEN", "")
+    if not (base_url and email and token):
+        return "scrum"
+    try:
+        creds = base64.b64encode(f"{email}:{token}".encode()).decode()
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(
+                f"{base_url}/rest/agile/1.0/board",
+                params={"projectKeyOrId": jira_project_key},
+                headers={"Authorization": f"Basic {creds}", "Accept": "application/json"},
+            )
+            if r.status_code == 200:
+                boards = r.json().get("values", [])
+                if boards:
+                    board_type = boards[0].get("type", "scrum").lower()
+                    return board_type if board_type in ("scrum", "kanban") else "other"
+    except Exception:
+        pass
+    return "scrum"  # safe default
 
 
 # ─── Redis helpers ────────────────────────────────────────────────────────────
@@ -66,13 +97,16 @@ async def _list_all() -> list[dict]:
 
 @router.post("", response_model=ProjectConfig, status_code=201)
 async def register_project(req: ProjectConfigCreate):
+    jira_key   = req.jira_project_key.upper()
+    methodology = await _detect_methodology(jira_key)
     cfg = {
         "id":                   str(uuid.uuid4()),
         "name":                 req.name,
         "team":                 req.team,
-        "jira_project_key":     req.jira_project_key.upper(),
+        "jira_project_key":     jira_key,
         "confluence_space_key": req.confluence_space_key.upper(),
         "repos":                [r.model_dump() for r in req.repos],
+        "methodology":          methodology,
         "created_at":           datetime.now(timezone.utc).isoformat(),
     }
     await _save(cfg)

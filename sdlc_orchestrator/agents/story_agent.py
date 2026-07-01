@@ -90,8 +90,18 @@ async def story_agent_node(state: SDLCState) -> SDLCState:
         req_text     = "\n".join(f"- {r}" for r in requirements)
         learning_ctx = json.dumps([l["content"] for l in learnings[:3]], indent=2) if learnings else ""
 
+        methodology = state.get("methodology", "scrum")
+        method_note = (
+            "Methodology: SCRUM — include story_points (1/2/3/5/8) for sprint planning."
+            if methodology == "scrum" else
+            "Methodology: KANBAN — omit sprint assignment; focus on WIP limits and continuous flow; story_points optional."
+            if methodology == "kanban" else
+            "Methodology: custom — generate stories without sprint or WIP assumptions."
+        )
+
         user_message = (
-            f"Tech stack: {', '.join(state.get('tech_stack', []))}\n\n"
+            f"Tech stack: {', '.join(state.get('tech_stack', []))}\n"
+            f"{method_note}\n\n"
             f"Requirements:\n{req_text}\n"
             + (f"\nPrevious patterns:\n{learning_ctx}" if learning_ctx else "")
         )
@@ -136,15 +146,17 @@ async def story_agent_node(state: SDLCState) -> SDLCState:
                 emit(EventType.TOOL, f"Creating {len(stories)} Jira issues in {jira_project} via MCP")
                 for story in stories:
                     try:
-                        result = await create_tool.ainvoke({
-                            "project_key":  jira_project,
-                            "summary":      story.get("summary", ""),
-                            "description":  _build_jira_description(story),
-                            "issue_type":   "Story",
-                            "priority":     story.get("priority", "Medium"),
-                            "labels":       story.get("tags", []),
-                            "story_points": story.get("story_points", 3),
-                        })
+                        payload = {
+                            "project_key": jira_project,
+                            "summary":     story.get("summary", ""),
+                            "description": _build_jira_description(story),
+                            "issue_type":  "Story",
+                            "priority":    story.get("priority", "Medium"),
+                            "labels":      story.get("tags", []),
+                        }
+                        if methodology != "kanban":
+                            payload["story_points"] = story.get("story_points", 3)
+                        result = await create_tool.ainvoke(payload)
                         jira_key = parse_mcp_key(result)
 
                         if jira_key:
