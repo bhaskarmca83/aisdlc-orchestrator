@@ -39,6 +39,7 @@ class ProjectConfigCreate(BaseModel):
     jira_project_key: str           # "PAY"
     confluence_space_key: str       # "PAY"
     repos: list[RepoEntry] = []
+    methodology: str = ""           # "scrum" | "kanban" | "other" | "" (auto-detect)
 
 class ProjectConfig(ProjectConfigCreate):
     id: str
@@ -97,8 +98,8 @@ async def _list_all() -> list[dict]:
 
 @router.post("", response_model=ProjectConfig, status_code=201)
 async def register_project(req: ProjectConfigCreate):
-    jira_key   = req.jira_project_key.upper()
-    methodology = await _detect_methodology(jira_key)
+    jira_key    = req.jira_project_key.upper()
+    methodology = req.methodology.lower() if req.methodology else await _detect_methodology(jira_key)
     cfg = {
         "id":                   str(uuid.uuid4()),
         "name":                 req.name,
