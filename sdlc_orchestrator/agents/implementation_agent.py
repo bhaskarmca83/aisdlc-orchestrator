@@ -60,9 +60,12 @@ async def implementation_agent_node(state: SDLCState) -> SDLCState:
         if not stories:
             raise ValueError("No stories for implementation")
 
-        conventions  = json.dumps(state.get("code_conventions", {}), indent=2)
-        api_ctx      = json.dumps(state.get("api_contracts", [])[:5], indent=2)
-        learning_ctx = json.dumps([l["content"] for l in learnings[:3]], indent=2) if learnings else ""
+        conventions      = json.dumps(state.get("code_conventions", {}), indent=2)
+        api_ctx          = json.dumps(state.get("api_contracts", [])[:5], indent=2)
+        design_artifacts = state.get("design_artifacts", {})
+        db_schema_ctx    = json.dumps(design_artifacts.get("db_schema", [])[:5], indent=2)
+        component_ctx    = json.dumps(design_artifacts.get("component_breakdown", [])[:5], indent=2)
+        learning_ctx     = json.dumps([l["content"] for l in learnings[:3]], indent=2) if learnings else ""
 
         stories_text = "\n\n".join(
             f"Story: [{s.get('jira_key','N/A')}] {s.get('summary','')}\n"
@@ -75,7 +78,9 @@ async def implementation_agent_node(state: SDLCState) -> SDLCState:
         user_message = (
             f"Tech stack: {', '.join(state.get('tech_stack', []))}\n"
             f"Code conventions:\n{conventions}\n"
-            f"API contracts:\n{api_ctx}\n\n"
+            f"API contracts:\n{api_ctx}\n"
+            f"DB schema:\n{db_schema_ctx}\n"
+            f"Component breakdown:\n{component_ctx}\n\n"
             f"Stories to implement:\n{stories_text}\n"
             + (f"\nPrevious patterns:\n{learning_ctx}" if learning_ctx else "")
         )
@@ -119,5 +124,5 @@ async def implementation_agent_node(state: SDLCState) -> SDLCState:
             "files_changed":    files_changed,
             "feature_branches": feature_branches,
             "current_stage":    "implement",
-            "retry_count":      state.get("retry_count", 0) + 1,
+            # retry_count is incremented in implement_with_retry wrapper — not here
         }

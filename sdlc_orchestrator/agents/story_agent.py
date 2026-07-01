@@ -1,5 +1,5 @@
 """sdlc_orchestrator/agents/story_agent.py
-ReAct agent: converts requirements into Jira stories and assigns repos.
+ReAct agent: converts requirements into INVEST-compliant Jira stories with ACs and test cases.
 Tools: Atlassian MCP (create_jira_issue, search_jira_issues, ...)
 """
 import json
@@ -13,29 +13,62 @@ from sdlc_orchestrator.providers.provider_factory import ProviderFactory, AgentR
 from sdlc_orchestrator.monitoring.tracker import EventType, emit, track_stage
 from sdlc_orchestrator.mcp.client import mcp_manager
 
-SYSTEM_PROMPT = """You are a Senior Product Manager. Convert requirements into Jira user stories.
+SYSTEM_PROMPT = """You are a Senior Product Manager. Convert requirements into INVEST-compliant Jira user stories.
 
 Output a JSON array ONLY — no prose, no markdown fences, just the raw JSON array:
 
 [
   {
     "jira_key": "PROJ-TBD",
-    "summary": "As a ... I want ... so that ...",
-    "description": "Detailed description of the story.",
+    "summary": "As a <role> I want <feature> so that <benefit>",
+    "description": "Detailed description including context and business value.",
     "story_points": 3,
+    "priority": "Medium",
     "tags": ["backend", "api"],
-    "acceptance_criteria": ["Given...", "When...", "Then..."],
+    "acceptance_criteria": [
+      "Given <context>, When <action>, Then <outcome>",
+      "Given <context>, When <action>, Then <outcome>"
+    ],
     "repos": ["aisdlc-backend"]
   }
 ]
 
 Rules:
 - Generate 2–5 stories maximum; keep them focused and concrete.
-- tags ["api","backend"] or acceptance criteria mentions "database" → repos: ["aisdlc-backend"]
+- story_points must be one of: 1, 2, 3, 5, 8
+- priority must be one of: Highest, High, Medium, Low, Lowest
+- Each story must have at least 2 acceptance_criteria in Given/When/Then format
+- tags ["api","backend"] or AC mentions "database" → repos: ["aisdlc-backend"]
 - tags ["ui","frontend"] or AC mentions "screen","page","form" → repos: ["aisdlc-frontend"]
 - tags ["infra","terraform"] or AC mentions "deploy" → repos: ["aisdlc-infra"]
-- default → repos: ["aisdlc-backend"]
-- story_points must be one of: 1, 2, 3, 5, 8"""
+- default → repos: ["aisdlc-backend"]"""
+
+
+def _build_jira_description(story: dict) -> str:
+    """Format description with ACs in Jira wiki markup."""
+    desc = story.get("description", "")
+    acs  = story.get("acceptance_criteria", [])
+    if not acs:
+        return desc
+    ac_lines = "\n".join(f"* {ac}" for ac in acs)
+    return f"{desc}\n\nh3. Acceptance Criteria\n{ac_lines}"
+
+
+def _generate_test_cases(stories: list[dict]) -> list[dict]:
+    """Derive one test case per AC at story creation — same cases used by test_agent + E2E."""
+    test_cases = []
+    for story in stories:
+        story_key = story.get("jira_key", "STORY")
+        for i, ac in enumerate(story.get("acceptance_criteria", []), 1):
+            test_cases.append({
+                "id":            f"{story_key}-TC{i:02d}",
+                "story_id":      story_key,
+                "story_summary": story.get("summary", ""),
+                "scenario":      ac,
+                "expected":      "Pass",
+                "status":        "pending",
+            })
+    return test_cases
 
 
 def resolve_repos(story: dict) -> list[str]:
@@ -75,6 +108,14 @@ async def story_agent_node(state: SDLCState) -> SDLCState:
             + (f"\nPrevious patterns:\n{learning_ctx}" if learning_ctx else "")
         )
 
+        # Inject PO revision reason if stories were previously rejected
+        revision_reason = state.get("po_revision_reason", "")
+        if revision_reason:
+            user_message = (
+                f"PREVIOUS STORIES REJECTED by Product Owner: {revision_reason}\n"
+                f"Please revise the stories to address these concerns.\n\n"
+            ) + user_message
+
         # Phase 1: LLM generates stories (no tools — small models can't handle 73 tools)
         emit(EventType.INFO, "Generating stories with LLM")
         response = await llm.ainvoke([
@@ -108,13 +149,31 @@ async def story_agent_node(state: SDLCState) -> SDLCState:
                 for story in stories:
                     try:
                         result = await create_tool.ainvoke({
-                            "project_key": jira_project,
-                            "summary":     story.get("summary", ""),
-                            "description": story.get("description", ""),
-                            "issue_type":  "Story",
+                            "project_key":  jira_project,
+                            "summary":      story.get("summary", ""),
+                            "description":  _build_jira_description(story),
+                            "issue_type":   "Story",
+                            "priority":     story.get("priority", "Medium"),
+                            "labels":       story.get("tags", []),
+                            "story_points": story.get("story_points", 3),
                         })
-                        if isinstance(result, dict) and result.get("key"):
-                            story["jira_key"] = result["key"]
+                        # MCP tools may return a dict, a JSON string, or plain text
+                        jira_key = None
+                        if isinstance(result, dict):
+                            jira_key = result.get("key")
+                        elif isinstance(result, str):
+                            try:
+                                parsed = json.loads(result)
+                                jira_key = parsed.get("key") if isinstance(parsed, dict) else None
+                            except (json.JSONDecodeError, AttributeError):
+                                pass
+                            if not jira_key:
+                                m = re.search(r'\b([A-Z][A-Z0-9]+-\d+)\b', result)
+                                if m:
+                                    jira_key = m.group(1)
+
+                        if jira_key:
+                            story["jira_key"] = jira_key
                             jira_synced += 1
                         else:
                             jira_failed += 1
@@ -138,17 +197,26 @@ async def story_agent_node(state: SDLCState) -> SDLCState:
 
         if jira_failed > 0 and jira_synced == 0:
             emit(EventType.ERROR,
-                 f"Jira sync FAILED for all {jira_failed} stories — check JIRA_BASE_URL and project key. "
-                 f"Stories exist in pipeline memory only.")
+                 f"Jira sync FAILED for all {jira_failed} stories — check JIRA_BASE_URL and project key.")
         elif jira_failed > 0:
-            emit(EventType.INFO,
-                 f"{jira_synced} stories synced to Jira, {jira_failed} failed.")
+            emit(EventType.INFO, f"{jira_synced} stories synced to Jira, {jira_failed} failed.")
         else:
             emit(EventType.DONE, f"{len(stories)} stories created in Jira project {jira_project}")
+
+        # Generate test cases from ACs at story creation (passed to test_agent + E2E)
+        test_cases = _generate_test_cases(stories)
+        emit(EventType.INFO, f"Generated {len(test_cases)} test cases from story ACs")
+
         await mem.save_story_learning({
             "story_id": state.get("current_story_id", ""), "agent_name": "story",
             "learning_type": "stories_generated",
-            "content": {"story_count": len(stories)}, "metadata": {},
+            "content": {"story_count": len(stories), "test_case_count": len(test_cases)}, "metadata": {},
         })
 
-        return {**state, "stories": stories, "assigned_repos": assigned_repos, "current_stage": "stories"}
+        return {
+            **state,
+            "stories":        stories,
+            "assigned_repos": assigned_repos,
+            "test_cases":     test_cases,
+            "current_stage":  "stories",
+        }

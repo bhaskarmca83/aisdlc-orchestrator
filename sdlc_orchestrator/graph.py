@@ -1,23 +1,29 @@
 """sdlc_orchestrator/graph.py
-LangGraph topology — corrected SDLC flow:
+LangGraph topology — full SDLC flow with revision loops and two-tier E2E:
   confluence → stories → [PO Gate] → design → [Arch Gate]
-  → implement → test → review → deploy → e2e
-Two interrupt_before gates give human sign-off at the right checkpoints.
+  → implement → test → review
+  → deploy_local → e2e_local → deploy_cloud → e2e_cloud
+
+Gates default to REJECT when payload is absent.
+PO rejection loops back to stories; arch rejection loops back to design.
+Local E2E blocks cloud deploy if it fails (unless it was skipped for a valid reason).
 """
 import os
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
 from sdlc_orchestrator.state import SDLCState
-from sdlc_orchestrator.agents.confluence_agent     import confluence_agent_node
-from sdlc_orchestrator.agents.story_agent          import story_agent_node
-from sdlc_orchestrator.agents.design_agent         import design_agent_node
-from sdlc_orchestrator.agents.implementation_agent import implementation_agent_node
-from sdlc_orchestrator.agents.test_agent           import test_agent_node
-from sdlc_orchestrator.agents.review_agent         import review_agent_node
-from sdlc_orchestrator.agents.deploy_agent         import deploy_agent_node
-from sdlc_orchestrator.agents.e2e_test_agent       import e2e_test_agent_node
-from sdlc_orchestrator.monitoring.tracker          import EventType, emit
+from sdlc_orchestrator.agents.confluence_agent      import confluence_agent_node
+from sdlc_orchestrator.agents.story_agent           import story_agent_node
+from sdlc_orchestrator.agents.design_agent          import design_agent_node
+from sdlc_orchestrator.agents.implementation_agent  import implementation_agent_node
+from sdlc_orchestrator.agents.test_agent            import test_agent_node
+from sdlc_orchestrator.agents.review_agent          import review_agent_node
+from sdlc_orchestrator.agents.deploy_local_agent    import deploy_local_agent_node
+from sdlc_orchestrator.agents.e2e_local_agent       import e2e_local_agent_node
+from sdlc_orchestrator.agents.deploy_cloud_agent    import deploy_cloud_agent_node
+from sdlc_orchestrator.agents.e2e_cloud_agent       import e2e_cloud_agent_node
+from sdlc_orchestrator.monitoring.tracker           import EventType, emit
 
 MAX_RETRY = int(os.environ.get("AGENT_MAX_RETRY", "2"))
 
@@ -25,24 +31,42 @@ MAX_RETRY = int(os.environ.get("AGENT_MAX_RETRY", "2"))
 # ─── Gate nodes ───────────────────────────────────────────────────────────────
 
 async def po_gate_node(state: SDLCState) -> SDLCState:
-    """Gate 1: Product Owner reviews and approves stories before design starts."""
-    emit(EventType.GATE, "PO approval received — proceeding to technical design")
-    approval = state.get("po_approval", {})
-    if approval and not approval.get("approved", True):
-        raise ValueError(f"PO rejected stories: {approval.get('reason', 'no reason given')}")
-    return {**state, "current_stage": "po_gate"}
+    """Gate 1: PO reviews stories. Rejected → loop back to story agent with reason."""
+    approval = state.get("po_approval")
+    if not approval or not approval.get("approved", False):
+        reason = (approval or {}).get("reason", "no reason given")
+        emit(EventType.GATE, f"PO rejected stories: {reason} — requesting revision")
+        return {**state, "current_stage": "po_gate", "po_revision_reason": reason, "po_approval": None}
+    emit(EventType.GATE, "PO approved stories — proceeding to technical design")
+    return {**state, "current_stage": "po_gate", "po_revision_reason": None}
 
 
 async def arch_gate_node(state: SDLCState) -> SDLCState:
-    """Gate 2: Architect reviews TSD and approves before implementation starts."""
-    emit(EventType.GATE, "Architect approval received — proceeding to implementation")
-    approval = state.get("arch_approval", {})
-    if approval and not approval.get("approved", True):
-        raise ValueError(f"Architect rejected TSD: {approval.get('reason', 'no reason given')}")
-    return {**state, "current_stage": "arch_gate"}
+    """Gate 2: Architect reviews TSD. Rejected → loop back to design agent with reason."""
+    approval = state.get("arch_approval")
+    if not approval or not approval.get("approved", False):
+        reason = (approval or {}).get("reason", "no reason given")
+        emit(EventType.GATE, f"Architect rejected TSD: {reason} — requesting revision")
+        return {**state, "current_stage": "arch_gate", "arch_revision_reason": reason, "arch_approval": None}
+    emit(EventType.GATE, "Architect approved TSD — proceeding to implementation")
+    return {**state, "current_stage": "arch_gate", "arch_revision_reason": None}
 
 
 # ─── Conditional routing ──────────────────────────────────────────────────────
+
+def route_after_po_gate(state: SDLCState) -> str:
+    if state.get("po_revision_reason"):
+        emit(EventType.ROUTE, "PO rejected — routing back to story agent for revision")
+        return "stories"
+    return "design"
+
+
+def route_after_arch_gate(state: SDLCState) -> str:
+    if state.get("arch_revision_reason"):
+        emit(EventType.ROUTE, "Architect rejected — routing back to design agent for revision")
+        return "design"
+    return "implement"
+
 
 def route_after_test(state: SDLCState) -> str:
     test_result = state.get("test_result", {})
@@ -58,23 +82,45 @@ def route_after_review(state: SDLCState) -> str:
     retry_count   = state.get("retry_count", 0)
     verdict       = review_result.get("verdict", "APPROVE")
     if verdict == "APPROVE" or retry_count >= MAX_RETRY:
-        return "deploy"
+        return "deploy_local"
     emit(EventType.ROUTE, f"Review requested changes (retry {retry_count + 1}/{MAX_RETRY}) — re-implementing")
     return "implement"
 
 
-def route_after_deploy(state: SDLCState) -> str:
-    deploy_status = state.get("deploy_status", {})
-    # Proceed to E2E if deployment happened at all (success OR planned for local dev)
-    if deploy_status:
-        return "e2e"
-    emit(EventType.ROUTE, "No deploy info — skipping E2E")
+def route_after_e2e_local(state: SDLCState) -> str:
+    stage_statuses = state.get("stage_statuses", {})
+    e2e_status     = stage_statuses.get("e2e_local", "")
+    e2e_results    = state.get("e2e_local_results", {})
+
+    if e2e_status == "skipped":
+        emit(EventType.ROUTE, "Local E2E skipped — proceeding to cloud deploy")
+        return "deploy_cloud"
+    if e2e_results.get("passed", False):
+        emit(EventType.ROUTE, "Local E2E passed — proceeding to cloud deploy")
+        return "deploy_cloud"
+    emit(EventType.ROUTE, "Local E2E failed — stopping before cloud deploy")
+    return END
+
+
+def route_after_deploy_cloud(state: SDLCState) -> str:
+    deployment_url = state.get("deployment_url", "")
+    stage_statuses = state.get("stage_statuses", {})
+    cloud_status   = stage_statuses.get("deploy_cloud", "")
+
+    if cloud_status == "skipped":
+        emit(EventType.ROUTE, "Cloud deploy skipped — skipping cloud E2E")
+        return END
+    if deployment_url:
+        emit(EventType.ROUTE, f"Cloud deploy ready at {deployment_url} — running cloud E2E")
+        return "e2e_cloud"
+    emit(EventType.ROUTE, "No deployment URL — skipping cloud E2E")
     return END
 
 
 # ─── Retry wrapper ────────────────────────────────────────────────────────────
 
 async def implement_with_retry(state: SDLCState) -> SDLCState:
+    """Wraps implementation_agent_node; retry_count is incremented HERE only."""
     new_state = await implementation_agent_node(state)
     return {**new_state, "retry_count": state.get("retry_count", 0) + 1}
 
@@ -87,33 +133,39 @@ checkpointer = MemorySaver()
 def build_graph():
     builder = StateGraph(SDLCState)
 
-    builder.add_node("confluence", confluence_agent_node)
-    builder.add_node("stories",    story_agent_node)
-    builder.add_node("po_gate",    po_gate_node)       # Gate 1: PO approves stories
-    builder.add_node("design",     design_agent_node)
-    builder.add_node("arch_gate",  arch_gate_node)     # Gate 2: Architect approves TSD
-    builder.add_node("implement",  implement_with_retry)
-    builder.add_node("test",       test_agent_node)
-    builder.add_node("review",     review_agent_node)
-    builder.add_node("deploy",     deploy_agent_node)
-    builder.add_node("e2e",        e2e_test_agent_node)
+    builder.add_node("confluence",    confluence_agent_node)
+    builder.add_node("stories",       story_agent_node)
+    builder.add_node("po_gate",       po_gate_node)
+    builder.add_node("design",        design_agent_node)
+    builder.add_node("arch_gate",     arch_gate_node)
+    builder.add_node("implement",     implement_with_retry)
+    builder.add_node("test",          test_agent_node)
+    builder.add_node("review",        review_agent_node)
+    builder.add_node("deploy_local",  deploy_local_agent_node)
+    builder.add_node("e2e_local",     e2e_local_agent_node)
+    builder.add_node("deploy_cloud",  deploy_cloud_agent_node)
+    builder.add_node("e2e_cloud",     e2e_cloud_agent_node)
 
     builder.set_entry_point("confluence")
     builder.add_edge("confluence", "stories")
-    builder.add_edge("stories",    "po_gate")    # pause — PO reviews stories
-    builder.add_edge("po_gate",    "design")
-    builder.add_edge("design",     "arch_gate")  # pause — Architect reviews TSD
-    builder.add_edge("arch_gate",  "implement")
-    builder.add_edge("implement",  "test")
+    builder.add_edge("stories",    "po_gate")
 
-    builder.add_conditional_edges("test",   route_after_test,   {"review": "review",  "implement": "implement"})
-    builder.add_conditional_edges("review", route_after_review, {"deploy": "deploy",  "implement": "implement"})
-    builder.add_conditional_edges("deploy", route_after_deploy, {"e2e": "e2e",        END: END})
-    builder.add_edge("e2e", END)
+    builder.add_conditional_edges("po_gate",   route_after_po_gate,   {"design": "design",     "stories": "stories"})
+    builder.add_edge("design", "arch_gate")
+    builder.add_conditional_edges("arch_gate", route_after_arch_gate, {"implement": "implement", "design": "design"})
+
+    builder.add_edge("implement", "test")
+    builder.add_conditional_edges("test",   route_after_test,         {"review": "review",       "implement": "implement"})
+    builder.add_conditional_edges("review", route_after_review,       {"deploy_local": "deploy_local", "implement": "implement"})
+
+    builder.add_edge("deploy_local", "e2e_local")
+    builder.add_conditional_edges("e2e_local",    route_after_e2e_local,    {"deploy_cloud": "deploy_cloud", END: END})
+    builder.add_conditional_edges("deploy_cloud", route_after_deploy_cloud, {"e2e_cloud": "e2e_cloud",       END: END})
+    builder.add_edge("e2e_cloud", END)
 
     return builder.compile(
         checkpointer=checkpointer,
-        interrupt_before=["po_gate", "arch_gate"],  # pause at both gates
+        interrupt_before=["po_gate", "arch_gate"],
     )
 
 

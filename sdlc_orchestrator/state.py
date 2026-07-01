@@ -44,6 +44,21 @@ class SDLCState(TypedDict):
     deploy_history: list[dict]
     e2e_test_suite: list[Any]
     rollback_events: list[dict]
+    # AC-derived test cases generated at story creation; passed to test_agent + E2E
+    test_cases: list[dict]
+    # Per-node status for skippable stages: "success" | "skipped" | "failed"
+    stage_statuses: dict[str, str]
+    # Local deployment URL (docker-compose / local dev server)
+    local_deployment_url: Optional[str]
+    local_deploy_skip_reason: Optional[str]
+    # Cloud deployment URL (dev/qa env after CI/CD deploy)
+    deployment_url: Optional[str]
+    # E2E results per environment
+    e2e_local_results: dict
+    e2e_cloud_results: dict
+    # Gate revision reasons injected into agent prompts on rejection
+    po_revision_reason: Optional[str]
+    arch_revision_reason: Optional[str]
     execution_id: str
     current_stage: str
     stage_timings: dict[str, float]

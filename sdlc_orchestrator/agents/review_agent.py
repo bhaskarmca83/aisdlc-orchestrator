@@ -15,15 +15,32 @@ from sdlc_orchestrator.mcp.client import mcp_manager
 
 SYSTEM_PROMPT = """You are a Principal Engineer doing a code review with access to GitHub tools.
 
+Definition of Done (DoD) — all items MUST be verified before approving:
+- All story acceptance criteria are implemented
+- Unit tests exist (>80% coverage for new code)
+- No OWASP Top 10 security vulnerabilities
+- API contracts match the Technical Design specification
+- Code follows project conventions (no raw SQL, no hardcoded secrets)
+- Performance: no N+1 queries, no blocking sync I/O in async paths
+
 Your task:
 1. Use GitHub tools to read the changed files on the feature branches
-2. Review for: correctness, security (OWASP Top 10), performance, conventions, testability
-3. Post a review comment on the PR via GitHub tools
-4. Respond with ONLY valid JSON:
+2. Cross-check implementation against the stories' acceptance criteria
+3. Verify the DoD checklist above
+4. Post a review comment on the PR via GitHub tools
+5. Respond with ONLY valid JSON:
 
 {
   "verdict": "APPROVE" | "REQUEST_CHANGES",
   "score": 0-100,
+  "dod_checklist": {
+    "acceptance_criteria": true,
+    "unit_tests": true,
+    "security": true,
+    "api_contracts": true,
+    "conventions": true,
+    "performance": true
+  },
   "critical_issues": [{"file": "...", "issue": "...", "fix": "..."}],
   "suggestions": ["..."],
   "summary": "..."
@@ -55,11 +72,20 @@ async def review_agent_node(state: SDLCState) -> SDLCState:
              for f in files_changed[:15]], indent=2
         )
         learning_ctx = json.dumps([l["content"] for l in learnings[:3]], indent=2) if learnings else ""
+        stories_ctx  = json.dumps(
+            [{"key": s.get("jira_key"), "summary": s.get("summary"), "ac": s.get("acceptance_criteria", [])}
+             for s in state.get("stories", [])[:5]], indent=2
+        )
+        test_result_ctx = json.dumps(state.get("test_result", {}), indent=2) if state.get("test_result") else ""
+        test_cases_ctx  = json.dumps(state.get("test_cases", [])[:15], indent=2) if state.get("test_cases") else ""
 
         user_message = (
             f"Tech stack: {', '.join(state.get('tech_stack', []))}\n"
             f"Retry count: {retry_count}\n"
             f"Files to review (read from GitHub):\n{files_ctx}\n"
+            f"\nStories with acceptance criteria:\n{stories_ctx}\n"
+            + (f"\nTest results:\n{test_result_ctx}" if test_result_ctx else "")
+            + (f"\nTest cases:\n{test_cases_ctx}" if test_cases_ctx else "")
             + (f"\nPrior review patterns:\n{learning_ctx}" if learning_ctx else "")
         )
 

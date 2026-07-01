@@ -144,6 +144,15 @@ async def run_pipeline(req: RunRequest):
         "deploy_history":         [],
         "e2e_test_suite":         [],
         "rollback_events":        [],
+        "test_cases":             [],
+        "stage_statuses":         {},
+        "local_deployment_url":   None,
+        "local_deploy_skip_reason": None,
+        "deployment_url":         None,
+        "e2e_local_results":      {},
+        "e2e_cloud_results":      {},
+        "po_revision_reason":     None,
+        "arch_revision_reason":   None,
         "execution_id":           execution_id,
         "current_stage":          "init",
         "stage_timings":          {},
@@ -167,12 +176,26 @@ async def run_pipeline(req: RunRequest):
 async def _run_graph(execution_id: str, state: SDLCState, config: dict):
     try:
         async for event in graph.astream(state, config):
-            stage = list(event.keys())[0] if event else "unknown"
+            stage       = list(event.keys())[0] if event else "unknown"
+            node_output = event.get(stage, {})
             await redis.xadd(
                 f"sdlc:events:{execution_id}",
                 {"data": json.dumps({"type": "stage_update", "stage": stage, "data": {}})},
                 maxlen=1000,
             )
+            # Emit stage_skip event for skippable nodes so the dashboard can reflect it
+            stage_statuses = node_output.get("stage_statuses", {})
+            if stage_statuses.get(stage) == "skipped":
+                skip_reason = (
+                    node_output.get("local_deploy_skip_reason")
+                    or node_output.get(f"{stage}_skip_reason")
+                    or ""
+                )
+                await redis.xadd(
+                    f"sdlc:events:{execution_id}",
+                    {"data": json.dumps({"type": "stage_skip", "stage": stage, "reason": skip_reason})},
+                    maxlen=1000,
+                )
             # Check for interrupt at either gate
             snap = await graph.aget_state(config)
             if snap and snap.next and snap.next[0] in ("po_gate", "arch_gate"):
@@ -184,8 +207,11 @@ async def _run_graph(execution_id: str, state: SDLCState, config: dict):
                 )
                 await redis.xadd(
                     f"sdlc:events:{execution_id}",
-                    {"data": json.dumps({"type": "gate", "gate": gate,
-                                         "message": _gate_message(gate, snap.values)})},
+                    {"data": json.dumps({
+                        "type": "gate", "gate": gate,
+                        "message": _gate_message(gate, snap.values),
+                        "stateSnapshot": _gate_snapshot(snap.values),
+                    })},
                     maxlen=1000,
                 )
                 return  # Pause; /api/gate/{id}/approve will resume
@@ -196,6 +222,10 @@ async def _run_graph(execution_id: str, state: SDLCState, config: dict):
             ex=3600,
         )
     except Exception as e:
+        try:
+            await graph.aupdate_state(config, {"error": str(e)})
+        except Exception:
+            pass
         await redis.set(
             f"run:{execution_id}:status",
             json.dumps({"status": "error", "error": str(e)}),
@@ -210,38 +240,48 @@ async def _run_graph(execution_id: str, state: SDLCState, config: dict):
 # ─── Gate helpers ─────────────────────────────────────────────────────────────
 
 _JIRA_BASE = os.environ.get("JIRA_BASE_URL", "https://bhaskarwork.atlassian.net")
-_JIRA_PROJ = os.environ.get("JIRA_PROJECT_KEY", "AISDLC")
 _CONF_BASE = os.environ.get("CONFLUENCE_BASE_URL", "https://bhaskarwork.atlassian.net/wiki")
 
 
 def _gate_message(gate: str, values: dict) -> str:
+    jira_proj = values.get("target_jira_project") or os.environ.get("JIRA_PROJECT_KEY", "AISDLC")
+    conf_space = values.get("target_confluence_space") or "SD"
     if gate == "po_gate":
-        stories = values.get("stories", [])
-        jira_url = f"{_JIRA_BASE}/jira/software/projects/{_JIRA_PROJ}/boards"
-        # Check whether stories are real (non-TBD Jira keys) or in-memory only
-        real = [s for s in stories if s.get("jira_key") and "-TBD" not in s.get("jira_key", "")]
-        lines = [f"PO Review — {len(stories)} stories generated:"]
+        stories  = values.get("stories", [])
+        jira_url = f"{_JIRA_BASE}/jira/software/projects/{jira_proj}/boards"
+        real     = [s for s in stories if s.get("jira_key") and "-TBD" not in s.get("jira_key", "")]
+        lines    = [f"PO Review — {len(stories)} stories generated:"]
         for s in stories:
             key  = s.get("jira_key", "?")
             summ = s.get("summary", "")[:80]
             pts  = s.get("story_points", "?")
-            if "-TBD" not in key and key != "?":
-                lines.append(f"  [{key}] ({pts}pts) {summ}")
-            else:
-                lines.append(f"  [in-memory] ({pts}pts) {summ}")
-        if real:
-            lines.append(f"\nView in Jira: {jira_url}")
-        else:
-            lines.append("\n⚠️  Jira sync failed — stories are in pipeline memory only. Check server logs.")
-        lines.append("\nApprove to proceed to Technical Design.")
+            prio = s.get("priority", "")
+            ac   = len(s.get("acceptance_criteria", []))
+            tag  = f"[{key}]" if ("-TBD" not in key and key != "?") else "[in-memory]"
+            lines.append(f"  {tag} ({pts}pts, {prio}, {ac} ACs) {summ}")
+        lines.append(f"\nView in Jira: {jira_url}" if real else
+                     "\nJira sync failed — stories in pipeline memory only.")
+        lines.append("Approve to proceed to Technical Design.")
         return "\n".join(lines)
     if gate == "arch_gate":
         tsd_id   = values.get("confluence_tsd_page_id", "")
-        page_url = (f"{_CONF_BASE}/spaces/SD/pages/{tsd_id}"
-                    if tsd_id else f"{_CONF_BASE}/spaces/SD")
-        return (f"Architect Review: Technical Design doc ready at {page_url}.\n"
+        page_url = (f"{_CONF_BASE}/spaces/{conf_space}/pages/{tsd_id}"
+                    if tsd_id else f"{_CONF_BASE}/spaces/{conf_space}")
+        return (f"Architect Review: TSD ready at {page_url}.\n"
                 f"Approve to start implementation.")
     return "Awaiting approval"
+
+
+def _gate_snapshot(values: dict) -> dict:
+    """Structured snapshot for frontend story cards and Confluence links."""
+    return {
+        "stories":                        values.get("stories", []),
+        "target_jira_project":            values.get("target_jira_project", ""),
+        "target_confluence_space":        values.get("target_confluence_space", ""),
+        "confluence_requirements_page_id": values.get("confluence_requirements_page_id", ""),
+        "confluence_tsd_page_id":         values.get("confluence_tsd_page_id", ""),
+        "test_cases":                     values.get("test_cases", []),
+    }
 
 
 # ─── Gate approval ────────────────────────────────────────────────────────────
@@ -280,12 +320,25 @@ async def approve_gate(execution_id: str, req: ApproveRequest):
 async def _resume_graph(execution_id: str, config: dict):
     try:
         async for event in graph.astream(None, config):
-            stage = list(event.keys())[0] if event else "unknown"
+            stage       = list(event.keys())[0] if event else "unknown"
+            node_output = event.get(stage, {})
             await redis.xadd(
                 f"sdlc:events:{execution_id}",
                 {"data": json.dumps({"type": "stage_update", "stage": stage})},
                 maxlen=1000,
             )
+            stage_statuses = node_output.get("stage_statuses", {})
+            if stage_statuses.get(stage) == "skipped":
+                skip_reason = (
+                    node_output.get("local_deploy_skip_reason")
+                    or node_output.get(f"{stage}_skip_reason")
+                    or ""
+                )
+                await redis.xadd(
+                    f"sdlc:events:{execution_id}",
+                    {"data": json.dumps({"type": "stage_skip", "stage": stage, "reason": skip_reason})},
+                    maxlen=1000,
+                )
             # Check if we hit the second gate
             snap = await graph.aget_state(config)
             if snap and snap.next and snap.next[0] in ("po_gate", "arch_gate"):
@@ -297,8 +350,11 @@ async def _resume_graph(execution_id: str, config: dict):
                 )
                 await redis.xadd(
                     f"sdlc:events:{execution_id}",
-                    {"data": json.dumps({"type": "gate", "gate": gate,
-                                         "message": _gate_message(gate, snap.values)})},
+                    {"data": json.dumps({
+                        "type": "gate", "gate": gate,
+                        "message": _gate_message(gate, snap.values),
+                        "stateSnapshot": _gate_snapshot(snap.values),
+                    })},
                     maxlen=1000,
                 )
                 return
@@ -309,6 +365,11 @@ async def _resume_graph(execution_id: str, config: dict):
             ex=3600,
         )
     except Exception as e:
+        try:
+            config = {"configurable": {"thread_id": execution_id}}
+            await graph.aupdate_state(config, {"error": str(e)})
+        except Exception:
+            pass
         await redis.set(
             f"run:{execution_id}:status",
             json.dumps({"status": "error", "error": str(e)}),
@@ -359,6 +420,14 @@ async def get_state_snapshot(execution_id: str):
     if not snap:
         raise HTTPException(status_code=404, detail="State not found")
     return {"values": snap.values, "next": list(snap.next)}
+
+
+@app.get("/api/config")
+async def get_config():
+    return {
+        "jira_base_url":       os.environ.get("JIRA_BASE_URL",       "https://bhaskarwork.atlassian.net"),
+        "confluence_base_url": os.environ.get("CONFLUENCE_BASE_URL", "https://bhaskarwork.atlassian.net/wiki"),
+    }
 
 
 @app.get("/health")
