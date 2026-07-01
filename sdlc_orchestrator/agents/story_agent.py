@@ -12,6 +12,7 @@ from sdlc_orchestrator.memory.shared_memory import SharedMemory
 from sdlc_orchestrator.providers.provider_factory import ProviderFactory, AgentRole
 from sdlc_orchestrator.monitoring.tracker import EventType, emit, track_stage
 from sdlc_orchestrator.mcp.client import mcp_manager
+from sdlc_orchestrator.agents._utils import resolve_repos, find_mcp_tool, parse_mcp_key
 
 SYSTEM_PROMPT = """You are a Senior Product Manager. Convert requirements into INVEST-compliant Jira user stories.
 
@@ -69,19 +70,6 @@ def _generate_test_cases(stories: list[dict]) -> list[dict]:
                 "status":        "pending",
             })
     return test_cases
-
-
-def resolve_repos(story: dict) -> list[str]:
-    tags = story.get("tags", [])
-    ac   = " ".join(story.get("acceptance_criteria", [])).lower()
-    repos = []
-    if any(t in tags for t in ["api", "backend"]) or "database" in ac:
-        repos.append("aisdlc-backend")
-    if any(t in tags for t in ["ui", "frontend"]) or any(w in ac for w in ["screen", "page", "form"]):
-        repos.append("aisdlc-frontend")
-    if any(t in tags for t in ["infra", "terraform"]) or "deploy" in ac:
-        repos.append("aisdlc-infra")
-    return repos or ["aisdlc-backend"]
 
 
 async def story_agent_node(state: SDLCState) -> SDLCState:
@@ -157,20 +145,7 @@ async def story_agent_node(state: SDLCState) -> SDLCState:
                             "labels":       story.get("tags", []),
                             "story_points": story.get("story_points", 3),
                         })
-                        # MCP tools may return a dict, a JSON string, or plain text
-                        jira_key = None
-                        if isinstance(result, dict):
-                            jira_key = result.get("key")
-                        elif isinstance(result, str):
-                            try:
-                                parsed = json.loads(result)
-                                jira_key = parsed.get("key") if isinstance(parsed, dict) else None
-                            except (json.JSONDecodeError, AttributeError):
-                                pass
-                            if not jira_key:
-                                m = re.search(r'\b([A-Z][A-Z0-9]+-\d+)\b', result)
-                                if m:
-                                    jira_key = m.group(1)
+                        jira_key = parse_mcp_key(result)
 
                         if jira_key:
                             story["jira_key"] = jira_key

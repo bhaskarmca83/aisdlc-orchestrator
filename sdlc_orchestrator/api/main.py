@@ -5,11 +5,14 @@ import os
 import json
 import uuid
 import asyncio
+import logging
+import time
 from typing import Any
 
 import redis.asyncio as aioredis
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 
 from sdlc_orchestrator.graph import graph
@@ -17,23 +20,46 @@ from sdlc_orchestrator.state import SDLCState
 from sdlc_orchestrator.monitoring.logger  import setup_logging
 from sdlc_orchestrator.monitoring.tracker import init_tracker, EventType, emit
 from sdlc_orchestrator.mcp.client import mcp_manager
+from sdlc_orchestrator.api.auth import verify_request, verify_ws_token
 from sdlc_orchestrator.api.projects import router as projects_router, init_project_router, _load as _load_project
 from sdlc_orchestrator.api.profiles import router as profiles_router, init_profiles_router
 from sdlc_orchestrator.api.validate  import router as validate_router
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
+_log = logging.getLogger("sdlc.http")
+
+REDIS_URL      = os.environ.get("REDIS_URL",      "redis://localhost:6379")
+FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "http://localhost:5173")
+
+PIPELINE_NODES = {
+    "confluence", "stories", "po_gate", "design", "arch_gate",
+    "implement", "test", "review",
+    "deploy_local", "e2e_local", "deploy_cloud", "e2e_cloud",
+}
 
 app = FastAPI(title="AI SDLC Orchestrator", version="1.0.0")
 app.include_router(projects_router)
 app.include_router(profiles_router)
 app.include_router(validate_router)
 
+_origins = [FRONTEND_ORIGIN] if FRONTEND_ORIGIN not in ("*", "") else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class _RequestLogger(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        t0 = time.monotonic()
+        response = await call_next(request)
+        ms = (time.monotonic() - t0) * 1000
+        _log.info("%s %s → %d (%.0fms)", request.method, request.url.path, response.status_code, ms)
+        return response
+
+
+app.add_middleware(_RequestLogger)
 
 redis: aioredis.Redis = None  # type: ignore
 
@@ -80,10 +106,9 @@ class ApproveRequest(BaseModel):
 # ─── Pipeline run ─────────────────────────────────────────────────────────────
 
 @app.post("/api/pipeline/run")
-async def run_pipeline(req: RunRequest):
+async def run_pipeline(req: RunRequest, _: None = Depends(verify_request)):
     execution_id = str(uuid.uuid4())
 
-    # Load team project config if a registered config ID was provided
     proj_cfg = None
     if req.project_config_id:
         proj_cfg = await _load_project(req.project_config_id)
@@ -173,30 +198,75 @@ async def run_pipeline(req: RunRequest):
     return {"execution_id": execution_id, "project_id": project_id, "status": "started"}
 
 
-async def _run_graph(execution_id: str, state: SDLCState, config: dict):
-    try:
-        async for event in graph.astream(state, config):
-            stage       = list(event.keys())[0] if event else "unknown"
-            node_output = event.get(stage, {})
+async def _process_events(execution_id: str, config: dict, stream):
+    """Shared event processor for both _run_graph and _resume_graph."""
+    started_stages: set[str] = set()
+    current_node = "unknown"
+    run_tokens = 0
+
+    async for event in stream:
+        kind = event["event"]
+        meta = event.get("metadata", {})
+        # langgraph_node identifies which pipeline node we're currently inside
+        node = meta.get("langgraph_node") or event.get("name", "")
+
+        if kind == "on_chain_start" and node in PIPELINE_NODES:
+            current_node = node
+            if node not in started_stages:
+                started_stages.add(node)
+                await redis.xadd(
+                    f"sdlc:events:{execution_id}",
+                    {"data": json.dumps({"type": "stage_start", "stage": node})},
+                    maxlen=1000,
+                )
+
+        elif kind == "on_llm_end":
+            usage = (event.get("data", {}).get("output") or {})
+            # LangChain usage_metadata shape
+            if hasattr(usage, "usage_metadata"):
+                usage = vars(usage.usage_metadata) if usage.usage_metadata else {}
+            elif isinstance(usage, dict):
+                usage = usage.get("usage_metadata", {}) or {}
+            else:
+                usage = {}
+            if usage:
+                prompt_t     = usage.get("input_tokens", 0)
+                completion_t = usage.get("output_tokens", 0)
+                run_tokens  += prompt_t + completion_t
+                await redis.xadd(
+                    f"sdlc:events:{execution_id}",
+                    {"data": json.dumps({
+                        "type": "metrics", "stage": current_node,
+                        "prompt_tokens": prompt_t,
+                        "completion_tokens": completion_t,
+                        "total_tokens": run_tokens,
+                    })},
+                    maxlen=1000,
+                )
+
+        elif kind == "on_chain_end" and node in PIPELINE_NODES:
+            node_output = event.get("data", {}).get("output") or {}
+            if not isinstance(node_output, dict):
+                node_output = {}
             await redis.xadd(
                 f"sdlc:events:{execution_id}",
-                {"data": json.dumps({"type": "stage_update", "stage": stage, "data": {}})},
+                {"data": json.dumps({"type": "stage_update", "stage": node, "data": {}})},
                 maxlen=1000,
             )
-            # Emit stage_skip event for skippable nodes so the dashboard can reflect it
             stage_statuses = node_output.get("stage_statuses", {})
-            if stage_statuses.get(stage) == "skipped":
+            if stage_statuses.get(node) == "skipped":
                 skip_reason = (
                     node_output.get("local_deploy_skip_reason")
-                    or node_output.get(f"{stage}_skip_reason")
+                    or node_output.get(f"{node}_skip_reason")
                     or ""
                 )
                 await redis.xadd(
                     f"sdlc:events:{execution_id}",
-                    {"data": json.dumps({"type": "stage_skip", "stage": stage, "reason": skip_reason})},
+                    {"data": json.dumps({"type": "stage_skip", "stage": node, "reason": skip_reason})},
                     maxlen=1000,
                 )
-            # Check for interrupt at either gate
+
+            # Check for gate interrupt after any pipeline node
             snap = await graph.aget_state(config)
             if snap and snap.next and snap.next[0] in ("po_gate", "arch_gate"):
                 gate = snap.next[0]
@@ -214,13 +284,23 @@ async def _run_graph(execution_id: str, state: SDLCState, config: dict):
                     })},
                     maxlen=1000,
                 )
-                return  # Pause; /api/gate/{id}/approve will resume
+                return True  # gate hit — caller should NOT mark completed
 
-        await redis.set(
-            f"run:{execution_id}:status",
-            json.dumps({"status": "completed", "stage": "done"}),
-            ex=3600,
+    return False  # no gate hit — stream finished normally
+
+
+async def _run_graph(execution_id: str, state: SDLCState, config: dict):
+    try:
+        gate_hit = await _process_events(
+            execution_id, config,
+            graph.astream_events(state, config, version="v2"),
         )
+        if not gate_hit:
+            await redis.set(
+                f"run:{execution_id}:status",
+                json.dumps({"status": "completed", "stage": "done"}),
+                ex=3600,
+            )
     except Exception as e:
         try:
             await graph.aupdate_state(config, {"error": str(e)})
@@ -244,7 +324,7 @@ _CONF_BASE = os.environ.get("CONFLUENCE_BASE_URL", "https://bhaskarwork.atlassia
 
 
 def _gate_message(gate: str, values: dict) -> str:
-    jira_proj = values.get("target_jira_project") or os.environ.get("JIRA_PROJECT_KEY", "AISDLC")
+    jira_proj  = values.get("target_jira_project") or os.environ.get("JIRA_PROJECT_KEY", "AISDLC")
     conf_space = values.get("target_confluence_space") or "SD"
     if gate == "po_gate":
         stories  = values.get("stories", [])
@@ -287,7 +367,7 @@ def _gate_snapshot(values: dict) -> dict:
 # ─── Gate approval ────────────────────────────────────────────────────────────
 
 @app.post("/api/gate/{execution_id}/approve")
-async def approve_gate(execution_id: str, req: ApproveRequest):
+async def approve_gate(execution_id: str, req: ApproveRequest, _: None = Depends(verify_request)):
     config = {"configurable": {"thread_id": execution_id}}
     snap   = await graph.aget_state(config)
 
@@ -298,7 +378,6 @@ async def approve_gate(execution_id: str, req: ApproveRequest):
     if active_gate not in ("po_gate", "arch_gate"):
         raise HTTPException(status_code=400, detail=f"Pipeline is at '{active_gate}', not a gate node")
 
-    # Write the approval into the correct state field
     approval = {"approved": req.approved, "reason": req.reason}
     if active_gate == "po_gate":
         await graph.aupdate_state(config, {"po_approval": approval, "approval_payload": approval})
@@ -319,54 +398,18 @@ async def approve_gate(execution_id: str, req: ApproveRequest):
 
 async def _resume_graph(execution_id: str, config: dict):
     try:
-        async for event in graph.astream(None, config):
-            stage       = list(event.keys())[0] if event else "unknown"
-            node_output = event.get(stage, {})
-            await redis.xadd(
-                f"sdlc:events:{execution_id}",
-                {"data": json.dumps({"type": "stage_update", "stage": stage})},
-                maxlen=1000,
-            )
-            stage_statuses = node_output.get("stage_statuses", {})
-            if stage_statuses.get(stage) == "skipped":
-                skip_reason = (
-                    node_output.get("local_deploy_skip_reason")
-                    or node_output.get(f"{stage}_skip_reason")
-                    or ""
-                )
-                await redis.xadd(
-                    f"sdlc:events:{execution_id}",
-                    {"data": json.dumps({"type": "stage_skip", "stage": stage, "reason": skip_reason})},
-                    maxlen=1000,
-                )
-            # Check if we hit the second gate
-            snap = await graph.aget_state(config)
-            if snap and snap.next and snap.next[0] in ("po_gate", "arch_gate"):
-                gate = snap.next[0]
-                await redis.set(
-                    f"run:{execution_id}:status",
-                    json.dumps({"status": "awaiting_approval", "stage": gate}),
-                    ex=3600,
-                )
-                await redis.xadd(
-                    f"sdlc:events:{execution_id}",
-                    {"data": json.dumps({
-                        "type": "gate", "gate": gate,
-                        "message": _gate_message(gate, snap.values),
-                        "stateSnapshot": _gate_snapshot(snap.values),
-                    })},
-                    maxlen=1000,
-                )
-                return
-
-        await redis.set(
-            f"run:{execution_id}:status",
-            json.dumps({"status": "completed", "stage": "done"}),
-            ex=3600,
+        gate_hit = await _process_events(
+            execution_id, config,
+            graph.astream_events(None, config, version="v2"),
         )
+        if not gate_hit:
+            await redis.set(
+                f"run:{execution_id}:status",
+                json.dumps({"status": "completed", "stage": "done"}),
+                ex=3600,
+            )
     except Exception as e:
         try:
-            config = {"configurable": {"thread_id": execution_id}}
             await graph.aupdate_state(config, {"error": str(e)})
         except Exception:
             pass
@@ -380,7 +423,8 @@ async def _resume_graph(execution_id: str, config: dict):
 # ─── WebSocket event stream ────────────────────────────────────────────────────
 
 @app.websocket("/ws/events/{execution_id}")
-async def websocket_events(ws: WebSocket, execution_id: str):
+async def websocket_events(ws: WebSocket, execution_id: str, token: str = Query("")):
+    verify_ws_token(token)
     await ws.accept()
     last_id = "0"
     try:
@@ -403,10 +447,10 @@ async def websocket_events(ws: WebSocket, execution_id: str):
         pass
 
 
-# ─── Status endpoint ──────────────────────────────────────────────────────────
+# ─── Status endpoints ─────────────────────────────────────────────────────────
 
 @app.get("/api/pipeline/{execution_id}/status")
-async def get_status(execution_id: str):
+async def get_status(execution_id: str, _: None = Depends(verify_request)):
     raw = await redis.get(f"run:{execution_id}:status")
     if not raw:
         raise HTTPException(status_code=404, detail="Execution not found")
@@ -414,7 +458,7 @@ async def get_status(execution_id: str):
 
 
 @app.get("/api/pipeline/{execution_id}/state")
-async def get_state_snapshot(execution_id: str):
+async def get_state_snapshot(execution_id: str, _: None = Depends(verify_request)):
     config = {"configurable": {"thread_id": execution_id}}
     snap   = await graph.aget_state(config)
     if not snap:

@@ -13,6 +13,7 @@ from sdlc_orchestrator.memory.shared_memory import SharedMemory
 from sdlc_orchestrator.providers.provider_factory import ProviderFactory, AgentRole
 from sdlc_orchestrator.monitoring.tracker import EventType, emit, track_stage
 from sdlc_orchestrator.mcp.client import mcp_manager
+from sdlc_orchestrator.agents._utils import find_mcp_tool, parse_mcp_id
 
 SYSTEM_PROMPT = """You are a Senior Business Analyst with access to Confluence tools.
 
@@ -59,23 +60,6 @@ def _build_prd_body(project_name: str, tech_stack: list, requirements: list,
         f"</ul>"
         f"<h2>6. Out of Scope</h2><p>TBD by development team</p>"
     )
-
-
-def _parse_mcp_page_id(result) -> str:
-    """Three-pass MCP response parser: dict → json.loads → regex."""
-    if isinstance(result, dict):
-        return result.get("id", "")
-    if isinstance(result, str):
-        try:
-            parsed = json.loads(result)
-            if isinstance(parsed, dict) and parsed.get("id"):
-                return str(parsed["id"])
-        except (json.JSONDecodeError, AttributeError):
-            pass
-        m = re.search(r'"id"\s*:\s*"(\d+)"', result)
-        if m:
-            return m.group(1)
-    return ""
 
 
 async def confluence_agent_node(state: SDLCState) -> SDLCState:
@@ -152,7 +136,7 @@ async def confluence_agent_node(state: SDLCState) -> SDLCState:
                         "title":     f"{parsed.get('project_name', state.get('project_name', 'Project'))} — Requirements",
                         "content":   prd_body,
                     })
-                    confluence_requirements_page_id = _parse_mcp_page_id(result)
+                    confluence_requirements_page_id = parse_mcp_id(result)
                     emit(EventType.TOOL, f"Created PRD page id={confluence_requirements_page_id}")
                 except Exception as e:
                     emit(EventType.ERROR, f"Confluence PRD creation failed: {e}")

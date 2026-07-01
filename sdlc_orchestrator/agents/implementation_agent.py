@@ -12,6 +12,7 @@ from sdlc_orchestrator.memory.shared_memory import SharedMemory
 from sdlc_orchestrator.providers.provider_factory import ProviderFactory, AgentRole
 from sdlc_orchestrator.monitoring.tracker import EventType, emit, track_stage
 from sdlc_orchestrator.mcp.client import mcp_manager
+from sdlc_orchestrator.agents._utils import resolve_repos
 
 SYSTEM_PROMPT = """You are a Senior Full-Stack Engineer with access to GitHub tools.
 
@@ -30,19 +31,6 @@ After completing all stories, respond with JSON:
   "feature_branches": {"repo-name": "branch-name"},
   "pull_requests": [{"repo": "...", "number": 0, "url": "..."}]
 }"""
-
-
-def resolve_repos(story: dict) -> list[str]:
-    tags = story.get("tags", [])
-    ac   = " ".join(story.get("acceptance_criteria", [])).lower()
-    repos = []
-    if any(t in tags for t in ["api", "backend"]) or "database" in ac:
-        repos.append("aisdlc-backend")
-    if any(t in tags for t in ["ui", "frontend"]) or any(w in ac for w in ["screen", "page", "form"]):
-        repos.append("aisdlc-frontend")
-    if any(t in tags for t in ["infra", "terraform"]) or "deploy" in ac:
-        repos.append("aisdlc-infra")
-    return repos or ["aisdlc-backend"]
 
 
 async def implementation_agent_node(state: SDLCState) -> SDLCState:

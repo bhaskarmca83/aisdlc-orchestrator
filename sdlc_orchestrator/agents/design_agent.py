@@ -12,6 +12,7 @@ from sdlc_orchestrator.memory.shared_memory import SharedMemory
 from sdlc_orchestrator.providers.provider_factory import ProviderFactory, AgentRole
 from sdlc_orchestrator.monitoring.tracker import EventType, emit, track_stage
 from sdlc_orchestrator.mcp.client import mcp_manager
+from sdlc_orchestrator.agents._utils import find_mcp_tool, parse_mcp_id
 
 SYSTEM_PROMPT = """You are a Senior Solutions Architect.
 
@@ -57,23 +58,6 @@ def _build_tsd_body(artifacts: dict) -> str:
         f"<h2>5. Security Notes</h2><ul>{''.join(f'<li>{n}</li>' for n in artifacts.get('security_notes',[]))}</ul>"
         f"<h2>6. Performance Notes</h2><ul>{''.join(f'<li>{n}</li>' for n in artifacts.get('performance_notes',[]))}</ul>"
     )
-
-
-def _parse_mcp_page_id(result) -> str:
-    """Three-pass MCP response parser: dict → json.loads → regex."""
-    if isinstance(result, dict):
-        return result.get("id", "")
-    if isinstance(result, str):
-        try:
-            parsed = json.loads(result)
-            if isinstance(parsed, dict) and parsed.get("id"):
-                return str(parsed["id"])
-        except (json.JSONDecodeError, AttributeError):
-            pass
-        m = re.search(r'"id"\s*:\s*"(\d+)"', result)
-        if m:
-            return m.group(1)
-    return ""
 
 
 async def design_agent_node(state: SDLCState) -> SDLCState:
@@ -147,7 +131,7 @@ async def design_agent_node(state: SDLCState) -> SDLCState:
                         "title":     f"{project_name} — Technical Design",
                         "content":   tsd_body,
                     })
-                    tsd_page_id = _parse_mcp_page_id(result)
+                    tsd_page_id = parse_mcp_id(result)
                     emit(EventType.TOOL, f"Created TSD page id={tsd_page_id}")
                 except Exception as e:
                     emit(EventType.ERROR, f"Confluence TSD creation failed: {e}")
