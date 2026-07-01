@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from sdlc_orchestrator.graph import graph
 from sdlc_orchestrator.state import SDLCState
+from sdlc_orchestrator.monitoring.logger  import setup_logging
 from sdlc_orchestrator.monitoring.tracker import init_tracker, EventType, emit
 from sdlc_orchestrator.mcp.client import mcp_manager
 from sdlc_orchestrator.api.projects import router as projects_router, init_project_router, _load as _load_project
@@ -39,6 +40,7 @@ redis: aioredis.Redis = None  # type: ignore
 
 @app.on_event("startup")
 async def startup():
+    setup_logging()
     global redis
     redis = aioredis.from_url(REDIS_URL, decode_responses=True)
     init_project_router(redis)
