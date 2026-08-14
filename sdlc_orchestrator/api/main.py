@@ -42,7 +42,10 @@ app.include_router(projects_router)
 app.include_router(profiles_router)
 app.include_router(validate_router)
 
-_origins = [FRONTEND_ORIGIN] if FRONTEND_ORIGIN not in ("*", "") else ["*"]
+_origins = (
+    ["*"] if FRONTEND_ORIGIN in ("*", "")
+    else list({FRONTEND_ORIGIN, "http://localhost:3000", "http://localhost:5173"})
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
@@ -190,11 +193,31 @@ async def run_pipeline(req: RunRequest, _: None = Depends(verify_request)):
 
     config = {"configurable": {"thread_id": execution_id}}
 
+    import time as _time
+    now = _time.time()
     await redis.set(
         f"run:{execution_id}:status",
         json.dumps({"status": "running", "stage": "init"}),
         ex=3600,
     )
+    # Store run metadata for history endpoint (7-day TTL)
+    await redis.set(
+        f"run:{execution_id}:meta",
+        json.dumps({
+            "execution_id": execution_id,
+            "project_id":   project_id,
+            "project_name": project_name,
+            "idea_short":   req.idea[:120],
+            "entry_type":   "",   # filled in after intake_agent completes
+            "methodology":  initial_state["methodology"],
+            "started_at":   now,
+            "completed_at": None,
+            "status":       "running",
+        }),
+        ex=604800,
+    )
+    await redis.zadd("pipeline:history", {execution_id: now})
+    await redis.zremrangebyrank("pipeline:history", 0, -201)  # keep last 200
 
     asyncio.create_task(_run_graph(execution_id, initial_state, config))
 
@@ -256,6 +279,29 @@ async def _process_events(execution_id: str, config: dict, stream):
                 {"data": json.dumps({"type": "stage_update", "stage": node, "data": {}})},
                 maxlen=1000,
             )
+            # Emit intake classification so dashboard can show badge + skipped stages
+            if node == "intake":
+                entry_type = node_output.get("entry_type", "fresh_idea")
+                _SKIPPED_BY_ENTRY = {
+                    "fresh_idea":     [],
+                    "existing_story": ["confluence", "stories", "po_gate"],
+                    "spike":          ["confluence", "stories", "po_gate"],
+                    "defect":         ["confluence", "stories", "po_gate", "design", "arch_gate"],
+                }
+                await redis.xadd(
+                    f"sdlc:events:{execution_id}",
+                    {"data": json.dumps({
+                        "type":           "intake_result",
+                        "entry_type":     entry_type,
+                        "stages_skipped": _SKIPPED_BY_ENTRY.get(entry_type, []),
+                    })},
+                    maxlen=1000,
+                )
+                meta_raw = await redis.get(f"run:{execution_id}:meta")
+                if meta_raw:
+                    meta = json.loads(meta_raw)
+                    meta["entry_type"] = entry_type
+                    await redis.set(f"run:{execution_id}:meta", json.dumps(meta), ex=604800)
             stage_statuses = node_output.get("stage_statuses", {})
             if stage_statuses.get(node) == "skipped":
                 skip_reason = (
@@ -292,6 +338,16 @@ async def _process_events(execution_id: str, config: dict, stream):
     return False  # no gate hit — stream finished normally
 
 
+async def _update_run_meta(execution_id: str, final_status: str) -> None:
+    import time as _time
+    meta_raw = await redis.get(f"run:{execution_id}:meta")
+    if meta_raw:
+        meta = json.loads(meta_raw)
+        meta["status"]       = final_status
+        meta["completed_at"] = _time.time()
+        await redis.set(f"run:{execution_id}:meta", json.dumps(meta), ex=604800)
+
+
 async def _run_graph(execution_id: str, state: SDLCState, config: dict):
     try:
         gate_hit = await _process_events(
@@ -304,6 +360,7 @@ async def _run_graph(execution_id: str, state: SDLCState, config: dict):
                 json.dumps({"status": "completed", "stage": "done"}),
                 ex=3600,
             )
+            await _update_run_meta(execution_id, "completed")
     except Exception as e:
         try:
             await graph.aupdate_state(config, {"error": str(e)})
@@ -314,6 +371,7 @@ async def _run_graph(execution_id: str, state: SDLCState, config: dict):
             json.dumps({"status": "error", "error": str(e)}),
             ex=3600,
         )
+        await _update_run_meta(execution_id, "error")
         await redis.xadd(
             f"sdlc:events:{execution_id}",
             {"data": json.dumps({"type": "error", "message": str(e)})},
@@ -475,6 +533,18 @@ async def get_config():
         "jira_base_url":       os.environ.get("JIRA_BASE_URL",       "https://bhaskarwork.atlassian.net"),
         "confluence_base_url": os.environ.get("CONFLUENCE_BASE_URL", "https://bhaskarwork.atlassian.net/wiki"),
     }
+
+
+@app.get("/api/pipeline/history")
+async def list_history(_: None = Depends(verify_request)):
+    """Return last 50 pipeline runs, newest first."""
+    ids = await redis.zrevrange("pipeline:history", 0, 49)
+    runs = []
+    for eid in ids:
+        raw = await redis.get(f"run:{eid}:meta")
+        if raw:
+            runs.append(json.loads(raw))
+    return runs
 
 
 @app.get("/health")

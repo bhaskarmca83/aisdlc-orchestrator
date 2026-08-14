@@ -54,10 +54,14 @@ async def test_agent_node(state: SDLCState) -> SDLCState:
         )
         learning_ctx = json.dumps([l["content"] for l in learnings[:3]], indent=2) if learnings else ""
 
+        test_cases = state.get("test_cases", [])
+        test_cases_ctx = json.dumps(test_cases[:20], indent=2) if test_cases else ""
+
         user_message = (
             f"Test framework: {state.get('test_framework', 'pytest')}\n"
             f"Tech stack: {', '.join(state.get('tech_stack', []))}\n\n"
             f"Files to test (read these from GitHub first):\n{files_ctx}\n"
+            + (f"\nAC-derived test cases to cover (these MUST all pass):\n{test_cases_ctx}\n" if test_cases_ctx else "")
             + (f"\nPrevious test patterns:\n{learning_ctx}" if learning_ctx else "")
         )
 
