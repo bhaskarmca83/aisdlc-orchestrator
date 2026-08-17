@@ -119,9 +119,13 @@ async def confluence_agent_node(state: SDLCState) -> SDLCState:
                 (t for t in tools if "create" in t.name.lower() and "page" in t.name.lower()), None
             )
             if create_tool:
-                space_key   = state.get("target_confluence_space", "").strip() \
-                              or os.environ.get("CONFLUENCE_SPACE_KEY", "SD")
-                parent_page = os.environ.get("CONFLUENCE_PARENT_PAGE", "524458")
+                space_key    = state.get("target_confluence_space", "").strip() \
+                               or os.environ.get("CONFLUENCE_SPACE_KEY", "SD")
+                env_space    = os.environ.get("CONFLUENCE_SPACE_KEY", "SD")
+                parent_page  = state.get("confluence_parent_page", "").strip() or (
+                    os.environ.get("CONFLUENCE_PARENT_PAGE", "")
+                    if space_key.upper() == env_space.upper() else ""
+                )
                 prd_body    = _build_prd_body(
                     project_name=parsed.get("project_name", state.get("project_name", "Project")),
                     tech_stack=parsed.get("tech_stack", []),
@@ -129,13 +133,15 @@ async def confluence_agent_node(state: SDLCState) -> SDLCState:
                     arch_decisions=parsed.get("architecture_decisions", []),
                     api_contracts=parsed.get("api_contracts", []),
                 )
+                call_args = {
+                    "space_key": space_key,
+                    "title":     f"{parsed.get('project_name', state.get('project_name', 'Project'))} — Requirements",
+                    "content":   prd_body,
+                }
+                if parent_page:
+                    call_args["parent_id"] = parent_page
                 try:
-                    result = await create_tool.ainvoke({
-                        "space_key": space_key,
-                        "parent_id": parent_page,
-                        "title":     f"{parsed.get('project_name', state.get('project_name', 'Project'))} — Requirements",
-                        "content":   prd_body,
-                    })
+                    result = await create_tool.ainvoke(call_args)
                     confluence_requirements_page_id = parse_mcp_id(result)
                     emit(EventType.TOOL, f"Created PRD page id={confluence_requirements_page_id}")
                 except Exception as e:

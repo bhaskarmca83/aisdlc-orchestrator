@@ -120,10 +120,11 @@ async def run_pipeline(req: RunRequest, _: None = Depends(verify_request)):
             raise HTTPException(status_code=404,
                                 detail=f"Project config '{req.project_config_id}' not found. Register it first via POST /api/projects")
 
-    project_id           = proj_cfg["id"]       if proj_cfg else str(uuid.uuid4())
-    project_name         = proj_cfg["name"]      if proj_cfg else (req.project_name or "SDLC Project")
-    jira_project_key     = proj_cfg["jira_project_key"]     if proj_cfg else req.jira_project_key
-    confluence_space_key = proj_cfg["confluence_space_key"] if proj_cfg else req.confluence_space_key
+    project_id              = proj_cfg["id"]       if proj_cfg else str(uuid.uuid4())
+    project_name            = proj_cfg["name"]      if proj_cfg else (req.project_name or "SDLC Project")
+    jira_project_key        = proj_cfg["jira_project_key"]     if proj_cfg else req.jira_project_key
+    confluence_space_key    = proj_cfg["confluence_space_key"] if proj_cfg else req.confluence_space_key
+    confluence_parent_page  = proj_cfg.get("confluence_parent_page", "") if proj_cfg else ""
 
     if not jira_project_key or not confluence_space_key:
         raise HTTPException(
@@ -182,6 +183,7 @@ async def run_pipeline(req: RunRequest, _: None = Depends(verify_request)):
         "e2e_cloud_results":      {},
         "po_revision_reason":     None,
         "arch_revision_reason":   None,
+        "confluence_parent_page": confluence_parent_page,
         "entry_type":             "",   # set by intake_agent
         "methodology":            proj_cfg.get("methodology", "scrum") if proj_cfg else "scrum",
         "execution_id":           execution_id,

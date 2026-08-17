@@ -62,6 +62,8 @@ class SDLCState(TypedDict):
     execution_id: str
     current_stage: str
     stage_timings: dict[str, float]
+    # Target Confluence parent page for THIS project (set from project config)
+    confluence_parent_page: str      # page ID to nest requirements + TSD under
     # Pipeline entry classification (set by intake_agent)
     entry_type: str          # "fresh_idea" | "existing_story" | "defect" | "spike"
     # Execution methodology detected from Jira board at project registration

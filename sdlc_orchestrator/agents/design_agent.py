@@ -121,16 +121,23 @@ async def design_agent_node(state: SDLCState) -> SDLCState:
             if create_tool:
                 space_key    = state.get("target_confluence_space", "").strip() \
                                or os.environ.get("CONFLUENCE_SPACE_KEY", "SD")
-                parent_page  = os.environ.get("CONFLUENCE_PARENT_PAGE", "524458")
+                # Per-project parent page; fall back to env var only if same space
+                env_space    = os.environ.get("CONFLUENCE_SPACE_KEY", "SD")
+                parent_page  = state.get("confluence_parent_page", "").strip() or (
+                    os.environ.get("CONFLUENCE_PARENT_PAGE", "")
+                    if space_key.upper() == env_space.upper() else ""
+                )
                 project_name = state.get("project_name", "Project")
                 tsd_body     = _build_tsd_body(artifacts)
+                call_args    = {
+                    "space_key": space_key,
+                    "title":     f"{project_name} — Technical Design",
+                    "content":   tsd_body,
+                }
+                if parent_page:
+                    call_args["parent_id"] = parent_page
                 try:
-                    result = await create_tool.ainvoke({
-                        "space_key": space_key,
-                        "parent_id": parent_page,
-                        "title":     f"{project_name} — Technical Design",
-                        "content":   tsd_body,
-                    })
+                    result = await create_tool.ainvoke(call_args)
                     tsd_page_id = parse_mcp_id(result)
                     emit(EventType.TOOL, f"Created TSD page id={tsd_page_id}")
                 except Exception as e:

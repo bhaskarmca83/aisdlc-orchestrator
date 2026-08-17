@@ -34,12 +34,13 @@ class RepoEntry(BaseModel):
     e2e_strategy: str = ""   # override profile default if needed
 
 class ProjectConfigCreate(BaseModel):
-    name: str                       # "Payment Gateway"
-    team: str                       # "Payments Team"
-    jira_project_key: str           # "PAY"
-    confluence_space_key: str       # "PAY"
+    name: str                           # "Payment Gateway"
+    team: str                           # "Payments Team"
+    jira_project_key: str               # "PAY"
+    confluence_space_key: str           # "PAY"
+    confluence_parent_page: str = ""    # Confluence page ID to nest pages under (space root if blank)
     repos: list[RepoEntry] = []
-    methodology: str = ""           # "scrum" | "kanban" | "other" | "" (auto-detect)
+    methodology: str = ""               # "scrum" | "kanban" | "other" | "" (auto-detect)
 
 class ProjectConfig(ProjectConfigCreate):
     id: str
@@ -101,14 +102,15 @@ async def register_project(req: ProjectConfigCreate):
     jira_key    = req.jira_project_key.upper()
     methodology = req.methodology.lower() if req.methodology else await _detect_methodology(jira_key)
     cfg = {
-        "id":                   str(uuid.uuid4()),
-        "name":                 req.name,
-        "team":                 req.team,
-        "jira_project_key":     jira_key,
-        "confluence_space_key": req.confluence_space_key.upper(),
-        "repos":                [r.model_dump() for r in req.repos],
-        "methodology":          methodology,
-        "created_at":           datetime.now(timezone.utc).isoformat(),
+        "id":                       str(uuid.uuid4()),
+        "name":                     req.name,
+        "team":                     req.team,
+        "jira_project_key":         jira_key,
+        "confluence_space_key":     req.confluence_space_key.upper(),
+        "confluence_parent_page":   req.confluence_parent_page.strip(),
+        "repos":                    [r.model_dump() for r in req.repos],
+        "methodology":              methodology,
+        "created_at":               datetime.now(timezone.utc).isoformat(),
     }
     await _save(cfg)
     return cfg

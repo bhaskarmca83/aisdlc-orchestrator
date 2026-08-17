@@ -29,8 +29,24 @@ def find_mcp_tool(tools: list, *name_parts: str) -> Optional[Any]:
     return None
 
 
+def _unwrap_mcp(result: Any) -> Any:
+    """Unwrap langchain-mcp-adapters list-of-content-blocks to the inner text/dict."""
+    if isinstance(result, list):
+        text = next(
+            (b.get("text", "") for b in result
+             if isinstance(b, dict) and b.get("type") == "text"),
+            "",
+        )
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return text
+    return result
+
+
 def parse_mcp_id(result: Any) -> str:
-    """Three-pass parser for MCP page/resource ID: dict → json.loads → regex."""
+    """Parse MCP page/resource ID from dict, JSON string, list-of-blocks, or raw string."""
+    result = _unwrap_mcp(result)
     if isinstance(result, dict):
         return str(result.get("id", ""))
     if isinstance(result, str):
@@ -40,14 +56,15 @@ def parse_mcp_id(result: Any) -> str:
                 return str(parsed["id"])
         except (json.JSONDecodeError, AttributeError):
             pass
-        m = re.search(r'"id"\s*:\s*"(\d+)"', result)
+        m = re.search(r'"id"\s*:\s*"?(\d+)"?', result)
         if m:
             return m.group(1)
     return ""
 
 
 def parse_mcp_key(result: Any) -> Optional[str]:
-    """Three-pass parser for Jira issue key (e.g. 'PROJ-42')."""
+    """Parse Jira issue key (e.g. 'PROJ-42') from dict, JSON string, or list-of-blocks."""
+    result = _unwrap_mcp(result)
     if isinstance(result, dict):
         return result.get("key")
     if isinstance(result, str):
