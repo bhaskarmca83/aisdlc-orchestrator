@@ -60,6 +60,10 @@ def _extract_jira_key(text: str) -> str | None:
 
 def _parse_jira_issue(raw) -> dict:
     """Extract fields from MCP Jira get-issue response."""
+    # langchain-mcp-adapters returns a list of LC content blocks: [{"type":"text","text":"..."}]
+    if isinstance(raw, list):
+        raw = next((b.get("text", "") for b in raw
+                    if isinstance(b, dict) and b.get("type") == "text"), "")
     if isinstance(raw, str):
         try:
             raw = json.loads(raw)
@@ -68,12 +72,20 @@ def _parse_jira_issue(raw) -> dict:
     if not isinstance(raw, dict):
         return {}
     fields = raw.get("fields", raw)  # some MCP wrappers flatten fields
+    # mcp-atlassian simplified dict uses "issue_type" (snake_case); Jira REST uses "issuetype"
+    issue_type_obj = fields.get("issuetype") or fields.get("issue_type") or {}
+    if isinstance(issue_type_obj, dict):
+        issue_type_name = issue_type_obj.get("name", "story")
+    else:
+        issue_type_name = str(issue_type_obj) if issue_type_obj else "story"
+    priority_obj = fields.get("priority") or {}
+    priority_name = priority_obj.get("name", "Medium") if isinstance(priority_obj, dict) else "Medium"
     return {
         "key":        raw.get("key", ""),
         "summary":    fields.get("summary", ""),
         "description": (fields.get("description") or ""),
-        "issue_type": (fields.get("issuetype") or {}).get("name", "story").lower(),
-        "priority":   (fields.get("priority")   or {}).get("name", "Medium"),
+        "issue_type": issue_type_name.lower(),
+        "priority":   priority_name,
         "story_points": fields.get("story_points") or fields.get("customfield_10016") or 3,
         "labels":     fields.get("labels", []),
     }
